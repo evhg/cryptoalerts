@@ -34,9 +34,11 @@ const SUPABASE_URL = env('SUPABASE_URL')
 const SERVICE_KEY = env('SUPABASE_SERVICE_ROLE_KEY')
 const RESEND_API_KEY = env('RESEND_API_KEY')
 
-// Returned by stusds_alert_begin(): settings live in Postgres, so the only
-// secret this function needs is RESEND_API_KEY.
+// Returned by stusds_alert_begin(): settings live in Postgres. The Resend key
+// comes from the RESEND_API_KEY function secret if set, otherwise from Vault
+// (handed over by stusds_alert_begin).
 type Config = {
+  resend_api_key?: string | null
   authorized: boolean
   enabled: boolean
   threshold_ppm: number
@@ -81,12 +83,13 @@ type SendResult = { ok: boolean; id?: string; error?: string }
 type Mail = { subject: string; text: string; html: string }
 
 async function sendEmail(cfg: Config, mail: Mail, idempotencyKey?: string): Promise<SendResult> {
-  if (!RESEND_API_KEY) return { ok: false, error: 'RESEND_API_KEY secret is not set on this function' }
+  const key = RESEND_API_KEY || cfg.resend_api_key || ''
+  if (!key) return { ok: false, error: 'no Resend API key: set the RESEND_API_KEY secret or store one through the setup route' }
   let error = 'not attempted'
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
       const headers: Record<string, string> = {
-        authorization: `Bearer ${RESEND_API_KEY}`,
+        authorization: `Bearer ${key}`,
         'content-type': 'application/json',
       }
       if (idempotencyKey) headers['idempotency-key'] = idempotencyKey
@@ -313,6 +316,22 @@ Deno.serve(async (req) => {
   // The caller's secret is checked against the one stored in Postgres, which
   // is also where pg_cron reads it from.
   const body = await req.json().catch(() => ({}))
+
+  // One-time setup: store the Resend key in Vault. Guarded by a single-use
+  // token whose hash was placed in stusds_alert.config beforehand.
+  const setupToken = req.headers.get('x-setup-token')
+  if (setupToken) {
+    try {
+      const res = await db('stusds_alert_set_resend_key', {
+        p_token: setupToken,
+        p_key: String(body?.resend_api_key ?? ''),
+      })
+      return json(res, res?.ok ? 200 : 400)
+    } catch {
+      return json({ ok: false, error: 'state store unavailable' }, 503)
+    }
+  }
+
   const secret = req.headers.get('x-cron-secret') ?? ''
   if (!secret) return json({ error: 'unauthorized' }, 401)
   let cfg: Config

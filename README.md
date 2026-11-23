@@ -53,8 +53,13 @@ double-send. If the email fails, the alert re-arms and the next block retries.
 update stusds_alert.config set threshold_ppm = 999000, cooldown_seconds = 600, enabled = true;
 ```
 
-The Resend API key is the only secret and is set as the edge function secret
-`RESEND_API_KEY`. `RPC_ENDPOINTS` (optional secret, JSON array of
+The Resend API key is the only secret. Set it as the edge function secret
+`RESEND_API_KEY`, or store it in Vault through the function's one-time setup
+route (see `20261123000200_stusds_alert_push_and_key.sql`).
+
+An alert also sends a Web Push through the sleep-lab app's own sender
+(`private.jarvis_push`), which reaches every device subscribed to Jarvis
+notifications. Turn it off with `update stusds_alert.config set push_enabled = false`. `RPC_ENDPOINTS` (optional secret, JSON array of
 `{"name","http","ws"}`) replaces the public RPC endpoints with your own.
 
 ### Checking on it
@@ -83,6 +88,8 @@ stalled" notice (at most every 6 hours).
    authenticates callers against the secret stored in `stusds_alert.config`)
    and set the `RESEND_API_KEY` secret.
 4. Apply `supabase/migrations/20261123000100_stusds_alert_schedule.sql`.
+5. Apply `supabase/migrations/20261123000200_stusds_alert_push_and_key.sql`
+   (Jarvis push, Vault key).
 
 ### Session watcher runbook
 
