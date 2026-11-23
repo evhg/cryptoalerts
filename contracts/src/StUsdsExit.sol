@@ -103,13 +103,23 @@ contract StUsdsExit {
             if (cap > maxTipWei) cap = maxTipWei;
             if (tip > cap) tip = cap;
             if (tip > 0) {
-                // A builder that cannot receive ETH simply forgoes the tip.
-                (bool paid,) = block.coinbase.call{value: tip}("");
+                // Fixed gas allowance and no return data copied: a hostile builder
+                // contract can neither burn this call's gas nor bloat its memory.
+                // A builder that cannot receive ETH this way simply forgoes the tip.
+                address builder = block.coinbase;
+                bool paid;
+                assembly ("memory-safe") {
+                    paid := call(60000, builder, tip, 0, 0, 0, 0)
+                }
                 if (!paid) tip = 0;
             }
             uint256 refund = msg.value - tip;
             if (refund > 0) {
-                (bool ok,) = msg.sender.call{value: refund}("");
+                address refundTo = msg.sender;
+                bool ok;
+                assembly ("memory-safe") {
+                    ok := call(gas(), refundTo, refund, 0, 0, 0, 0)
+                }
                 if (!ok) revert RefundFailed();
             }
         }

@@ -45,7 +45,12 @@ const USDS = '0xdC035D45d973E3EC169d2276DDab16f1e407384F'
 const LOCKSTAKE_ENGINE = '0xCe01C90dE7FD1bcFa39e237FE6D8D9F569e8A6a3'
 // The only address `sweep` and a 'main' deployment can ever name.
 const MAIN_WALLET = '0xCD532243888D26791881064E24D4A25FD0041d98'
-const EXPECTED_CREATION_HASH = '0x696e36f55f617fac99564887aef49886e18ef1908613869e71f2cc0cddc82381'
+const EXPECTED_CREATION_HASH = '0x8c9fd8b2762ee45ad4eb46fe6e1c3f36809bc4b92a135aaec22360e1dd1ad0ca'
+// keccak256 of the deployed code with its two immutables (stUSDS, owner) zeroed,
+// and the byte offsets where those immutables sit in the deployed code.
+const EXPECTED_RUNTIME_HASH = '0x3606de2aa68df51213e3fadde7191abc95ce209ec7139944a19b533b02852e0b'
+const STUSDS_OFFSETS = [265, 675, 1160, 1341]
+const OWNER_OFFSETS = [361, 479, 628, 1118, 1290, 1475]
 
 const exitAbi = parseAbi([
   'constructor(address stUsds_, address owner_, address keeper_, uint256 minAssetsFloor_, uint256 tipWeiPerUsds_, uint256 maxTipWei_)',
@@ -160,6 +165,35 @@ async function email(ctx: Ctx, subject: string, text: string) {
   }
 }
 
+/**
+ * The bot never calls, and never sends ETH to, an address just because the
+ * config names it. The contract there must be byte-for-byte the tested build,
+ * bound to stUSDS and to an owner this bot is allowed to serve. This closes
+ * the "someone edits helper_address" route to the keeper's ETH.
+ */
+const verified = new Map<string, Hex>()
+async function verifyHelper(ctx: Ctx): Promise<{ helper: Hex; owner: Hex }> {
+  if (!ctx.config.helper_address) throw new Error('no helper configured')
+  const helper = getAddress(ctx.config.helper_address)
+  const cached = verified.get(helper)
+  if (cached) return { helper, owner: cached }
+  const code = await client.getCode({ address: helper })
+  if (!code || code === '0x') throw new Error('helper has no code')
+  let hex = code.slice(2)
+  const word = (off: number) => hex.slice(off * 2, off * 2 + 64)
+  const st = word(STUSDS_OFFSETS[0])
+  const ow = word(OWNER_OFFSETS[0])
+  if (STUSDS_OFFSETS.some((o) => word(o) !== st) || OWNER_OFFSETS.some((o) => word(o) !== ow)) throw new Error('helper code is not the tested build')
+  for (const off of [...STUSDS_OFFSETS, ...OWNER_OFFSETS]) hex = hex.slice(0, off * 2) + '0'.repeat(64) + hex.slice(off * 2 + 64)
+  if (keccak256(`0x${hex}`) !== EXPECTED_RUNTIME_HASH) throw new Error('helper code is not the tested build')
+  if (getAddress(`0x${st.slice(24)}`) !== getAddress(ST_USDS)) throw new Error('helper is not bound to stUSDS')
+  const owner = getAddress(`0x${ow.slice(24)}`)
+  const allowed = [MAIN_WALLET, ctx.testOwner?.address].filter(Boolean).map((a) => getAddress(a as string))
+  if (!allowed.includes(owner)) throw new Error('helper belongs to an owner this bot does not serve')
+  verified.set(helper, owner)
+  return { helper, owner }
+}
+
 // ---------- transactions ----------
 
 type TxReq = { to?: Hex; data?: Hex; value?: bigint; gas: bigint }
@@ -214,7 +248,7 @@ async function builderCall(b: (typeof BUILDERS)[number], signer: PrivateKeyAccou
 async function buildExit(ctx: Ctx) {
   const cfg = ctx.config
   const keeper = ctx.keeper!
-  const helper = getAddress(cfg.helper_address)
+  const { helper } = await verifyHelper(ctx)
   const minAssets = parseUnits(String(cfg.min_assets_usds ?? 0), 18)
   const gas = 500_000n
   const [shares, balance] = await Promise.all([
@@ -385,6 +419,9 @@ async function status(ctx: Ctx) {
     out[name] = { address: a, eth: formatEther(eth), usds: formatUnits(usds, 18), stusds_worth_usds: formatUnits(worth, 18) }
   }
   if (ctx.config.helper_address) {
+    out.helper_code = await verifyHelper(ctx).then(() => 'verified: tested build').catch((e) => `REJECTED: ${String(e)}`)
+  }
+  if (ctx.config.helper_address && String(out.helper_code).startsWith('verified')) {
     const h = getAddress(ctx.config.helper_address)
     const read = (fn: any) => client.readContract({ address: h, abi: exitAbi, functionName: fn })
     const [owner, keeper, floor, perUsds, maxTip, redeemable] = await Promise.all([
@@ -430,10 +467,9 @@ async function deploy(ctx: Ctx, body: any) {
 
 /** Test wallet only: give it gas money and approve its exit contract. */
 async function approveTest(ctx: Ctx) {
-  const helper = getAddress(ctx.config.helper_address)
   const t = ctx.testOwner!
-  const owner = await client.readContract({ address: helper, abi: exitAbi, functionName: 'owner' })
-  if (getAddress(owner) !== t.address) throw new Error('configured helper does not belong to the test wallet')
+  const { helper, owner } = await verifyHelper(ctx)
+  if (owner !== t.address) throw new Error('configured helper does not belong to the test wallet')
   const need = parseEther('0.0003')
   if ((await client.getBalance({ address: t.address })) < need) {
     await sendPublic(ctx.keeper!, { to: t.address, value: need, gas: 21_000n })

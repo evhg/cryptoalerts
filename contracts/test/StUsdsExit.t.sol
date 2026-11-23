@@ -43,6 +43,24 @@ contract ReentrantCoinbase {
     }
 }
 
+/// A hostile block builder that burns all the gas it is given and returns a huge blob.
+contract GasBurningCoinbase {
+    receive() external payable {
+        uint256 i;
+        while (true) {
+            i++;
+        }
+    }
+}
+
+contract ReturnBombCoinbase {
+    receive() external payable {
+        assembly {
+            return(0, 40000)
+        }
+    }
+}
+
 /// Fork tests against real mainnet state around the liquidity event of
 /// 2026-11-23: a 3,000,000 USDS repayment landed in block 26477749 and the
 /// freed liquidity was withdrawn by others in block 26477750.
@@ -302,6 +320,121 @@ contract StUsdsExitTest is Test {
         assertTrue(rc.reentryBlocked(), "re-entry was attempted and refused");
         assertEq(usds.balanceOf(OWNER) - usdsBefore, assets);
         assertEq(st.balanceOf(OWNER), 0);
+    }
+
+    function test_gasBurningBuilderCannotBlockOrDrainTheExit() public {
+        _fork(ALERT_BLOCK);
+        _approveAll();
+        GasBurningCoinbase gb = new GasBurningCoinbase();
+        vm.deal(address(gb), 0);
+        vm.coinbase(address(gb));
+        vm.prank(keeper);
+        uint256 gasBefore = gasleft();
+        uint256 assets = exitC.exit{gas: 500_000, value: MAX_TIP}(type(uint256).max, 0);
+        uint256 gasUsed = gasBefore - gasleft();
+        assertGt(assets, 1_000_000e18, "exit still completes");
+        assertEq(st.balanceOf(OWNER), 0);
+        assertEq(address(gb).balance, 0, "a builder that misbehaves gets no tip");
+        assertEq(keeper.balance, 1 ether, "tip refunded");
+        assertLt(gasUsed, 330_000, "its gas burn is bounded by the fixed allowance");
+    }
+
+    function test_returnBombFromBuilderIsHarmless() public {
+        _fork(ALERT_BLOCK);
+        _approveAll();
+        ReturnBombCoinbase rb = new ReturnBombCoinbase();
+        vm.deal(address(rb), 0);
+        vm.coinbase(address(rb));
+        vm.prank(keeper);
+        uint256 gasBefore = gasleft();
+        exitC.exit{gas: 500_000, value: MAX_TIP}(type(uint256).max, 0);
+        assertLt(gasBefore - gasleft(), 330_000);
+        assertEq(st.balanceOf(OWNER), 0);
+    }
+
+    function test_frontRunnerTakingTheLiquidityOnlyMakesUsRevert() public {
+        // A competitor drains the pool first. Our call reverts, so sent as a
+        // bundle it is simply not included; nothing of the owner's moves.
+        _fork(ALERT_BLOCK);
+        _approveAll();
+        address whale = makeAddr("whale"); // a competitor holding a large position
+        deal(ST_USDS, whale, 3_000_000e18);
+        vm.startPrank(whale);
+        (bool ok,) = ST_USDS.call(abi.encodeWithSignature("withdraw(uint256,address,address)", st.maxWithdraw(whale), whale, whale));
+        vm.stopPrank();
+        assertTrue(ok, "competitor emptied the pool");
+        assertLt(st.maxWithdraw(OWNER), 1e18);
+
+        uint256 sharesBefore = st.balanceOf(OWNER);
+        vm.prank(keeper);
+        vm.expectRevert();
+        exitC.exit{value: MAX_TIP}(type(uint256).max, 0);
+        assertEq(st.balanceOf(OWNER), sharesBefore);
+        assertEq(builder.balance, 0);
+        assertEq(keeper.balance, 1 ether);
+    }
+
+    function test_sandwichAroundTheExitChangesNothingForTheOwner() public {
+        // Deposit just before us and withdraw just after: a redemption has no
+        // price to move, so the owner receives exactly the position's value.
+        _fork(ALERT_BLOCK);
+        _approveAll();
+        uint256 worth = st.convertToAssets(st.balanceOf(OWNER));
+        address attacker = makeAddr("attacker");
+        deal(USDS, attacker, 5_000_000e18);
+        vm.startPrank(attacker);
+        usds.approve(ST_USDS, 5_000_000e18);
+        st.deposit(5_000_000e18, attacker);
+        vm.stopPrank();
+
+        vm.prank(keeper);
+        uint256 assets = exitC.exit{value: MAX_TIP}(type(uint256).max, 0);
+        assertApproxEqAbs(assets, worth, 1e12);
+
+        vm.startPrank(attacker);
+        (bool ok,) = ST_USDS.call(abi.encodeWithSignature("redeem(uint256,address,address)", st.maxRedeem(attacker), attacker, attacker));
+        vm.stopPrank();
+        assertTrue(ok);
+        assertLe(usds.balanceOf(attacker), 5_000_000e18 + 1e18, "and the attacker gained nothing");
+    }
+
+    function test_tokensAndEthSentToTheContractGiveNoLeverage() public {
+        // Griefers can donate shares or force ETH in; neither changes what the
+        // owner receives, and the contract has no way to move either out.
+        _fork(ALERT_BLOCK);
+        _approveAll();
+        deal(ST_USDS, address(exitC), 1_000e18);
+        vm.deal(address(exitC), 3 ether);
+        uint256 worth = st.convertToAssets(st.balanceOf(OWNER));
+        vm.prank(keeper);
+        uint256 assets = exitC.exit{value: MAX_TIP}(type(uint256).max, 0);
+        assertApproxEqAbs(assets, worth, 1e12);
+        assertEq(st.balanceOf(address(exitC)), 1_000e18, "donated shares untouched");
+        assertEq(address(exitC).balance, 3 ether, "forced ETH is never paid out as a tip");
+        assertLe(builder.balance, MAX_TIP);
+    }
+
+    function test_noSelectorMovesFundsAnywhereButTheOwner() public {
+        // Throw every plausible "transfer-like" call at the contract as the keeper.
+        _fork(ALERT_BLOCK);
+        _approveAll();
+        bytes[6] memory calls = [
+            abi.encodeWithSignature("transfer(address,uint256)", keeper, 1e18),
+            abi.encodeWithSignature("transferFrom(address,address,uint256)", OWNER, keeper, 1e18),
+            abi.encodeWithSignature("redeem(uint256,address,address)", 1e18, keeper, OWNER),
+            abi.encodeWithSignature("withdraw(uint256,address,address)", 1e18, keeper, OWNER),
+            abi.encodeWithSignature("sweep(address)", keeper),
+            abi.encodeWithSignature("execute(address,bytes)", ST_USDS, abi.encodeWithSignature("transferFrom(address,address,uint256)", OWNER, keeper, 1e18))
+        ];
+        uint256 sharesBefore = st.balanceOf(OWNER);
+        for (uint256 i = 0; i < calls.length; i++) {
+            vm.prank(keeper);
+            (bool ok,) = address(exitC).call(calls[i]);
+            assertFalse(ok, "unknown selector must revert");
+        }
+        assertEq(st.balanceOf(OWNER), sharesBefore);
+        assertEq(st.balanceOf(keeper), 0);
+        assertEq(usds.balanceOf(keeper), 0);
     }
 
     // ---------- arbitrary liquidity ----------
