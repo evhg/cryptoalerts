@@ -259,6 +259,24 @@ async function builderCall(b: (typeof BUILDERS)[number], signer: PrivateKeyAccou
   }
 }
 
+// Plain public-mempool nodes (MEV Blocker is deliberately not here: it is a private route).
+const PUBLIC_MEMPOOL = ['https://ethereum-rpc.publicnode.com', 'https://eth.drpc.org']
+
+async function publicSend(url: string, raw: Hex) {
+  const started = Date.now()
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_sendRawTransaction', params: [raw] }),
+      signal: AbortSignal.timeout(4000),
+    })
+    return { builder: `mempool:${new URL(url).host}`, status: res.status, ms: Date.now() - started, body: (await res.text()).slice(0, 160) }
+  } catch (e) {
+    return { builder: `mempool:${new URL(url).host}`, error: String(e).slice(0, 120), ms: Date.now() - started }
+  }
+}
+
 /** Send a transaction only as a bundle to builders (never the public mempool) and wait for it. */
 async function sendPrivate(account: PrivateKeyAccount, req: TxReq, priorityGwei: number) {
   const { raw, hash, head } = await signTx(account, req, priorityGwei)
@@ -323,13 +341,20 @@ async function fire(ctx: Ctx, seenBlock: number) {
     return { skipped: 'simulation reverted' }
   }
 
-  const { raw, hash, head, nonce } = await signTx(x.keeper, { to: x.helper, data: x.data, value: x.tip, gas: x.gas }, Number(cfg.priority_gwei ?? 2))
+  // Always the confirmed nonce: a still-pending public copy of an earlier attempt
+  // must be replaced, not queued behind (builders drop bundles with a nonce gap).
+  const confirmedNonce = await client.getTransactionCount({ address: x.keeper.address, blockTag: 'latest' })
+  const { raw, hash, head, nonce } = await signTx(x.keeper, { to: x.helper, data: x.data, value: x.tip, gas: x.gas }, Number(cfg.priority_gwei ?? 2), confirmedNonce)
   const targets = [head.number + 1n, head.number + 2n, head.number + 3n]
   const sent = LOCAL_SUBMIT
     ? [{ builder: 'local-fork', body: await client.sendRawTransaction({ serializedTransaction: raw }) }]
-    : await Promise.all(
-      BUILDERS.flatMap((b) => targets.map((t) => builderCall(b, x.keeper, 'eth_sendBundle', [{ txs: [raw], blockNumber: toHex(t) }]))),
-    )
+    : await Promise.all([
+      ...BUILDERS.flatMap((b) => targets.map((t) => builderCall(b, x.keeper, 'eth_sendBundle', [{ txs: [raw], blockNumber: toHex(t) }]))),
+      // Some validators build their own blocks from the public mempool, which no
+      // bundle can reach. A public copy covers those. If it is beaten it just
+      // reverts (no tip is paid on failure, only roughly 50-80k gas).
+      ...(cfg.public_broadcast ? PUBLIC_MEMPOOL.map((u) => publicSend(u, raw)) : []),
+    ])
   const sentMs = Date.now() - started
   await log(ctx, seenBlock, 'fired', {
     hash,
