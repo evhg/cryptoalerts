@@ -10,6 +10,11 @@
 //   exit 30  RPC_FAILURE this watcher itself cannot read the chain
 //   exit 0   SUPERSEDED / EXPIRED   a newer instance took over, or max runtime reached
 //
+// Email: the deployed watcher normally sends it. This one sends it too when
+// STUSDS_SESSION_EMAIL is "always", or (default "fallback") when the deployed
+// watcher looked unhealthy at the last check. Needs RESEND_API_KEY,
+// STUSDS_ALERT_TO and STUSDS_ALERT_FROM in the environment.
+//
 // Arming state survives restarts in ~/.stusds-watch/state.json, so restarting
 // after an alert does not re-alert until utilization has gone back above the
 // threshold (and the cooldown has passed).
@@ -43,6 +48,11 @@ const COOLDOWN_MS = Number(process.env.STUSDS_COOLDOWN_SECONDS ?? 600) * 1000
 const MAX_RUN_MS = Number(process.env.STUSDS_MAX_MINUTES ?? 115) * 60_000
 const HEALTH_URL = process.env.STUSDS_HEALTH_URL ?? 'https://vaelokyqjdsxveqvdtbo.supabase.co/functions/v1/stusds-watch'
 const POLL_MS = 1000
+const EMAIL_MODE = process.env.STUSDS_SESSION_EMAIL ?? 'fallback' // always | fallback | never
+const RESEND_API_KEY = process.env.RESEND_API_KEY ?? ''
+const EMAIL_TO = process.env.STUSDS_ALERT_TO ?? ''
+const EMAIL_FROM = process.env.STUSDS_ALERT_FROM ?? ''
+const TEST = process.env.STUSDS_TEST === '1'
 const NOTICE_EVERY_MS = 6 * 3600_000
 
 type State = {
@@ -141,7 +151,48 @@ const describe = (s: Snapshot) => ({
   detectedSecondsAfterBlock: Number(((Date.now() - s.timestamp * 1000) / 1000).toFixed(1)),
 })
 
-const onSnapshot = (s: Snapshot) => {
+let deployedHealthy = false
+
+const sendSessionEmail = async (s: Snapshot): Promise<string> => {
+  if (EMAIL_MODE === 'never') return 'not attempted (disabled)'
+  if (EMAIL_MODE !== 'always' && deployedHealthy) return 'not attempted (deployed watcher sends it)'
+  if (!RESEND_API_KEY || !EMAIL_TO || !EMAIL_FROM) return 'not attempted (RESEND_API_KEY / STUSDS_ALERT_TO / STUSDS_ALERT_FROM not set)'
+  const d = describe(s)
+  const subject = `${TEST ? '[TEST] ' : ''}stUSDS utilization ${fmtPct(s.utilPpm)} - ${d.withdrawableUsds} USDS withdrawable`
+  const text = [
+    TEST
+      ? 'This is a test of the stUSDS alert pipeline. Figures below are live, but the threshold has not been crossed.'
+      : `stUSDS utilization dropped to ${fmtPct(s.utilPpm)}, at or below your ${fmtPct(Number(THRESHOLD_PPM), 1)} threshold. Liquidity can be taken by other withdrawers or borrowers at any moment.`,
+    '',
+    `Utilization: ${fmtPct(s.utilPpm)}`,
+    `Withdrawable now: ${d.withdrawableUsds} USDS`,
+    `Total stUSDS assets: ${d.totalAssetsUsds} USDS`,
+    `Block: ${s.block} (${d.blockTime})`,
+    `Sent: ${d.detectedSecondsAfterBlock}s after the block timestamp (from the Claude session watcher)`,
+    '',
+    'Withdraw in the Sky app: https://app.sky.money/?network=ethereum&widget=expert',
+    `Block: https://etherscan.io/block/${s.block}`,
+  ].join('\n')
+  let err = ''
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const res = await fetch('https://api.resend.com/emails', {
+        method: 'POST',
+        headers: { authorization: `Bearer ${RESEND_API_KEY}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ from: EMAIL_FROM, to: [EMAIL_TO], subject, text }),
+        signal: AbortSignal.timeout(6000),
+      })
+      const body = await res.text()
+      if (res.ok) return `sent ${JSON.parse(body).id}`
+      err = `resend ${res.status}: ${body.slice(0, 160)}`
+    } catch (e) {
+      err = String(e)
+    }
+  }
+  return `failed: ${err}`
+}
+
+const onSnapshot = async (s: Snapshot) => {
   state.lastBlock = s.block
   state.lastUtilPpm = s.utilPpm
   state.lastEvalAt = Date.now()
@@ -159,7 +210,10 @@ const onSnapshot = (s: Snapshot) => {
     if (state.armed && Date.now() >= state.lastAlertAt + COOLDOWN_MS) {
       state.armed = false
       state.lastAlertAt = Date.now()
-      finish(10, 'ALERT', describe(s))
+      saveState(state)
+      const detail = describe(s)
+      const sessionEmail = await sendSessionEmail(s)
+      finish(10, 'ALERT', { ...detail, sessionEmail })
     }
   } else if (!state.armed) {
     state.armed = true
@@ -179,6 +233,7 @@ const checkHealth = async () => {
   } catch {
     healthFailures++
   }
+  deployedHealthy = h?.ok === true
   const staleFor = typeof h?.age_seconds === 'number' ? h.age_seconds : null
   const stale = (h && h.enabled !== false && staleFor !== null && staleFor > 300) || healthFailures >= 5
   if (stale && Date.now() > state.lastStaleNoticeAt + NOTICE_EVERY_MS) {
@@ -187,9 +242,11 @@ const checkHealth = async () => {
   }
 }
 
+await checkHealth().catch(() => {})
+
 let i = 0
 let busy = false
-let lastHealthAt = 0
+let lastHealthAt = Date.now()
 let lastLogAt = Date.now()
 let lastOkAt = Date.now()
 
@@ -205,7 +262,7 @@ while (true) {
         if (n > state.lastBlock || !tookOver) {
           const s = await readSnapshotAt([ep.http, ...urls.filter((u) => u !== ep.http)], setup, n, 3)
           lastOkAt = Date.now()
-          onSnapshot(s)
+          await onSnapshot(s)
         } else {
           lastOkAt = Date.now()
         }
