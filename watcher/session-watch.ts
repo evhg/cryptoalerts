@@ -119,7 +119,11 @@ const finish = (code: number, label: string, detail: Record<string, unknown>) =>
   process.exit(code)
 }
 
-process.on('SIGTERM', () => finish(0, 'SUPERSEDED', { by: readPid() }))
+process.on('SIGTERM', () => {
+  const pid = readPid()
+  if (pid && pid !== process.pid) finish(0, 'SUPERSEDED', { by: pid })
+  else finish(0, 'STOPPED', {})
+})
 
 let setup: Setup = DEFAULT_SETUP
 try {
