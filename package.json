@@ -1,0 +1,12 @@
+{
+  "name": "cryptoalerts",
+  "private": true,
+  "type": "module",
+  "description": "Alert when stUSDS utilization drops to 99.9% or lower",
+  "engines": { "node": ">=22.18" },
+  "scripts": {
+    "test": "node --test test/*.test.ts",
+    "watch": "node watcher/session-watch.ts",
+    "status": "node watcher/session-watch.ts --status"
+  }
+}
