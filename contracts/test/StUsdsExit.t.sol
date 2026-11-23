@@ -1,0 +1,337 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.28;
+
+import {Test, console2} from "forge-std/Test.sol";
+import {StUsdsExit} from "../src/StUsdsExit.sol";
+
+interface IStUsds {
+    function balanceOf(address) external view returns (uint256);
+    function approve(address, uint256) external returns (bool);
+    function convertToAssets(uint256) external view returns (uint256);
+    function maxWithdraw(address) external view returns (uint256);
+    function maxRedeem(address) external view returns (uint256);
+    function deposit(uint256 assets, address receiver) external returns (uint256);
+    function totalAssets() external view returns (uint256);
+}
+
+interface IERC20 {
+    function balanceOf(address) external view returns (uint256);
+    function approve(address, uint256) external returns (bool);
+}
+
+/// A block builder address that refuses ETH.
+contract RejectingCoinbase {
+    receive() external payable {
+        revert("no thanks");
+    }
+}
+
+/// A hostile block builder that tries to call back into the exit contract.
+contract ReentrantCoinbase {
+    StUsdsExit public target;
+    bool public reentryBlocked;
+
+    function aim(StUsdsExit t) external {
+        target = t;
+    }
+
+    receive() external payable {
+        try target.exit(type(uint256).max, 0) {}
+        catch {
+            reentryBlocked = true;
+        }
+    }
+}
+
+/// Fork tests against real mainnet state around the liquidity event of
+/// 2026-11-23: a 3,000,000 USDS repayment landed in block 26477749 and the
+/// freed liquidity was withdrawn by others in block 26477750.
+contract StUsdsExitTest is Test {
+    address constant ST_USDS = 0x99CD4Ec3f88A45940936F469E4bB72A2A701EEB9;
+    address constant USDS = 0xdC035D45d973E3EC169d2276DDab16f1e407384F;
+    address constant OWNER = 0xCD532243888D26791881064E24D4A25FD0041d98;
+
+    uint256 constant ALERT_BLOCK = 26477749; // 2.09M USDS withdrawable at its end
+    uint256 constant NEXT_BLOCK = 26477750; // 16.6K left at its end
+    uint256 constant DRY_BLOCK = 26477753; // nothing withdrawable
+
+    // About $100 of ETH (at ~$1,720) for a full exit of ~1.275M USDS.
+    uint256 constant TIP_WEI_PER_USDS = 46_000_000_000; // 4.6e10 wei per USDS
+    uint256 constant MAX_TIP = 0.06 ether;
+    uint256 constant FLOOR = 100e18;
+
+    IStUsds st = IStUsds(ST_USDS);
+    IERC20 usds = IERC20(USDS);
+    address keeper = makeAddr("keeper");
+    address builder = makeAddr("builder");
+    StUsdsExit exitC;
+
+    function _fork(uint256 blockNumber) internal {
+        vm.createSelectFork(vm.envOr("MAINNET_RPC_URL", string("https://mainnet.gateway.tenderly.co")), blockNumber);
+        // Act as a transaction in the following block.
+        vm.roll(blockNumber + 1);
+        vm.warp(block.timestamp + 12);
+        vm.coinbase(builder);
+        exitC = new StUsdsExit(ST_USDS, OWNER, keeper, FLOOR, TIP_WEI_PER_USDS, MAX_TIP);
+        // Forge's default deployment addresses hold stray dust on mainnet; start clean.
+        vm.deal(address(exitC), 0);
+        vm.deal(builder, 0);
+        vm.deal(keeper, 1 ether);
+    }
+
+    function _approveAll() internal {
+        vm.prank(OWNER);
+        st.approve(address(exitC), type(uint256).max);
+    }
+
+    // ---------- replay of the real event ----------
+
+    function test_replay_fullExitInTheBlockAfterTheAlert() public {
+        _fork(ALERT_BLOCK);
+        _approveAll();
+
+        uint256 sharesBefore = st.balanceOf(OWNER);
+        uint256 worth = st.convertToAssets(sharesBefore);
+        uint256 usdsBefore = usds.balanceOf(OWNER);
+        assertGt(st.maxWithdraw(OWNER), 1_000_000e18, "liquidity should cover the position");
+
+        vm.prank(keeper);
+        uint256 gasBefore = gasleft();
+        uint256 assets = exitC.exit{value: MAX_TIP}(type(uint256).max, 1_000_000e18);
+        uint256 gasUsed = gasBefore - gasleft();
+
+        assertEq(st.balanceOf(OWNER), 0, "all shares redeemed");
+        assertEq(usds.balanceOf(OWNER) - usdsBefore, assets, "USDS went to the owner");
+        assertApproxEqAbs(assets, worth, 1e12, "received the full value");
+        assertEq(usds.balanceOf(address(exitC)), 0, "contract holds nothing");
+        assertEq(st.balanceOf(address(exitC)), 0, "contract holds nothing");
+
+        uint256 expectedTip = (assets * TIP_WEI_PER_USDS) / 1e18;
+        if (expectedTip > MAX_TIP) expectedTip = MAX_TIP;
+        assertEq(builder.balance, expectedTip, "builder tip");
+        assertEq(keeper.balance, 1 ether - expectedTip, "rest refunded to keeper");
+        assertEq(address(exitC).balance, 0, "no ETH left behind");
+
+        console2.log("shares redeemed      ", sharesBefore / 1e18);
+        console2.log("USDS received        ", assets / 1e18);
+        console2.log("tip paid (gwei)      ", expectedTip / 1e9);
+        console2.log("gas used by exit call", gasUsed);
+    }
+
+    function test_replay_partialFillOneBlockLater() public {
+        _fork(NEXT_BLOCK);
+        _approveAll();
+
+        uint256 sharesBefore = st.balanceOf(OWNER);
+        uint256 available = st.maxWithdraw(OWNER);
+        assertGt(available, 10_000e18);
+        assertLt(available, 20_000e18);
+
+        vm.prank(keeper);
+        uint256 assets = exitC.exit{value: MAX_TIP}(type(uint256).max, 0);
+
+        assertApproxEqAbs(assets, available, 1e12, "took what was there");
+        assertGt(st.balanceOf(OWNER), 0, "rest of the position untouched");
+        assertLt(st.balanceOf(OWNER), sharesBefore);
+        // Tip scales with the amount actually redeemed: ~16.6K USDS, not 1.27M.
+        uint256 tip = builder.balance;
+        assertEq(tip, (assets * TIP_WEI_PER_USDS) / 1e18);
+        assertLt(tip, MAX_TIP / 50);
+        console2.log("partial USDS received", assets / 1e18);
+        console2.log("partial tip (gwei)   ", tip / 1e9);
+    }
+
+    function test_replay_nothingAvailableReverts() public {
+        _fork(DRY_BLOCK);
+        _approveAll();
+        uint256 sharesBefore = st.balanceOf(OWNER);
+
+        vm.prank(keeper);
+        vm.expectRevert();
+        exitC.exit{value: MAX_TIP}(type(uint256).max, 0);
+
+        assertEq(st.balanceOf(OWNER), sharesBefore);
+        assertEq(keeper.balance, 1 ether, "a failed attempt costs no tip");
+    }
+
+    // ---------- who can do what ----------
+
+    function test_onlyKeeperOrOwnerCanExit() public {
+        _fork(ALERT_BLOCK);
+        _approveAll();
+
+        address stranger = makeAddr("stranger");
+        vm.deal(stranger, 1 ether);
+        vm.prank(stranger);
+        vm.expectRevert(StUsdsExit.NotAuthorized.selector);
+        exitC.exit{value: 0.01 ether}(type(uint256).max, 0);
+
+        // The owner can always trigger it themselves.
+        vm.prank(OWNER);
+        uint256 assets = exitC.exit(type(uint256).max, 0);
+        assertGt(assets, 1_000_000e18);
+    }
+
+    function test_onlyOwnerCanConfigure() public {
+        _fork(DRY_BLOCK);
+        vm.prank(keeper);
+        vm.expectRevert(StUsdsExit.NotAuthorized.selector);
+        exitC.configure(keeper, 0, type(uint256).max, type(uint256).max);
+
+        vm.prank(OWNER);
+        exitC.configure(address(0xBEEF), 5e18, 1, 2);
+        assertEq(exitC.keeper(), address(0xBEEF));
+        assertEq(exitC.minAssetsFloor(), 5e18);
+        assertEq(exitC.tipWeiPerUsds(), 1);
+        assertEq(exitC.maxTipWei(), 2);
+    }
+
+    function test_withoutApprovalNothingMoves() public {
+        _fork(ALERT_BLOCK);
+        uint256 sharesBefore = st.balanceOf(OWNER);
+        vm.prank(keeper);
+        vm.expectRevert(StUsdsExit.NothingToRedeem.selector);
+        exitC.exit(type(uint256).max, 0);
+        assertEq(st.balanceOf(OWNER), sharesBefore);
+    }
+
+    function test_allowanceBoundsTheRedemption() public {
+        _fork(ALERT_BLOCK);
+        vm.prank(OWNER);
+        st.approve(address(exitC), 1_000e18);
+        uint256 sharesBefore = st.balanceOf(OWNER);
+
+        vm.prank(keeper);
+        exitC.exit(type(uint256).max, 0);
+        assertEq(sharesBefore - st.balanceOf(OWNER), 1_000e18, "only the approved shares");
+
+        // Allowance is used up: a second call has nothing to work with.
+        vm.prank(keeper);
+        vm.expectRevert(StUsdsExit.NothingToRedeem.selector);
+        exitC.exit(type(uint256).max, 0);
+    }
+
+    function test_maxSharesBoundsTheRedemption() public {
+        _fork(ALERT_BLOCK);
+        _approveAll();
+        uint256 sharesBefore = st.balanceOf(OWNER);
+        vm.prank(keeper);
+        exitC.exit(50_000e18, 0);
+        assertEq(sharesBefore - st.balanceOf(OWNER), 50_000e18);
+    }
+
+    // ---------- hostile conditions ----------
+
+    function test_dustBaitIsRefused() public {
+        // Someone leaves a few USDS of liquidity to lure the bot into paying a tip.
+        _fork(DRY_BLOCK);
+        _approveAll();
+        address baiter = makeAddr("baiter");
+        deal(USDS, baiter, 50e18);
+        vm.startPrank(baiter);
+        usds.approve(ST_USDS, 50e18);
+        st.deposit(50e18, baiter);
+        vm.stopPrank();
+        assertGt(st.maxWithdraw(OWNER), 40e18, "bait liquidity is visible");
+
+        uint256 sharesBefore = st.balanceOf(OWNER);
+        vm.prank(keeper);
+        vm.expectRevert(); // BelowMinimum: under the owner's 100 USDS floor
+        exitC.exit{value: MAX_TIP}(type(uint256).max, 0);
+        assertEq(st.balanceOf(OWNER), sharesBefore);
+        assertEq(builder.balance, 0);
+        assertEq(keeper.balance, 1 ether);
+    }
+
+    function test_keeperMinimumIsEnforced() public {
+        _fork(NEXT_BLOCK); // only ~16.6K available
+        _approveAll();
+        vm.prank(keeper);
+        vm.expectRevert();
+        exitC.exit{value: MAX_TIP}(type(uint256).max, 100_000e18);
+        assertEq(builder.balance, 0);
+    }
+
+    function test_overOfferedTipIsCappedAndRefunded() public {
+        _fork(ALERT_BLOCK);
+        _approveAll();
+        vm.deal(keeper, 10 ether);
+        vm.prank(keeper);
+        exitC.exit{value: 10 ether}(type(uint256).max, 0);
+        assertLe(builder.balance, MAX_TIP);
+        assertEq(keeper.balance, 10 ether - builder.balance);
+    }
+
+    function test_stolenKeeperKeyCanOnlyPayTheOwner() public {
+        // The worst a thief with the keeper key can do is run the exit: every
+        // USDS still lands in the owner's wallet and the tip stays capped.
+        _fork(ALERT_BLOCK);
+        _approveAll();
+        uint256 usdsBefore = usds.balanceOf(OWNER);
+        vm.deal(keeper, 5 ether);
+        vm.prank(keeper);
+        uint256 assets = exitC.exit{value: 5 ether}(type(uint256).max, 0);
+        assertEq(usds.balanceOf(OWNER) - usdsBefore, assets);
+        assertEq(usds.balanceOf(keeper), 0);
+        assertLe(builder.balance, MAX_TIP);
+    }
+
+    function test_builderThatRejectsEthStillLetsTheExitThrough() public {
+        _fork(ALERT_BLOCK);
+        _approveAll();
+        RejectingCoinbase rc = new RejectingCoinbase();
+        vm.deal(address(rc), 0);
+        vm.coinbase(address(rc));
+        vm.prank(keeper);
+        uint256 assets = exitC.exit{value: MAX_TIP}(type(uint256).max, 0);
+        assertGt(assets, 1_000_000e18);
+        assertEq(address(rc).balance, 0);
+        assertEq(keeper.balance, 1 ether, "whole tip refunded");
+    }
+
+    function test_reentrantBuilderGetsNowhere() public {
+        _fork(ALERT_BLOCK);
+        _approveAll();
+        ReentrantCoinbase rc = new ReentrantCoinbase();
+        rc.aim(exitC);
+        vm.deal(address(rc), 0);
+        vm.coinbase(address(rc));
+        uint256 usdsBefore = usds.balanceOf(OWNER);
+        vm.prank(keeper);
+        uint256 assets = exitC.exit{value: MAX_TIP}(type(uint256).max, 0);
+        assertTrue(rc.reentryBlocked(), "re-entry was attempted and refused");
+        assertEq(usds.balanceOf(OWNER) - usdsBefore, assets);
+        assertEq(st.balanceOf(OWNER), 0);
+    }
+
+    // ---------- arbitrary liquidity ----------
+
+    /// Liquidity of any size appears (here via a deposit); the exit takes
+    /// min(liquidity, position) and never reverts for rounding reasons.
+    function testFuzz_takesWhatLiquidityAllows(uint256 liquidity) public {
+        liquidity = bound(liquidity, 200e18, 3_000_000e18);
+        _fork(DRY_BLOCK);
+        _approveAll();
+
+        address depositor = makeAddr("depositor");
+        deal(USDS, depositor, liquidity);
+        vm.startPrank(depositor);
+        usds.approve(ST_USDS, liquidity);
+        st.deposit(liquidity, depositor);
+        vm.stopPrank();
+
+        uint256 worth = st.convertToAssets(st.balanceOf(OWNER));
+        uint256 expected = st.maxWithdraw(OWNER);
+        uint256 usdsBefore = usds.balanceOf(OWNER);
+
+        vm.prank(keeper);
+        uint256 assets = exitC.exit{value: MAX_TIP}(type(uint256).max, 0);
+
+        assertEq(usds.balanceOf(OWNER) - usdsBefore, assets);
+        assertApproxEqAbs(assets, expected, 1e12);
+        assertLe(assets, worth + 1e12);
+        if (liquidity > worth + 1e18) assertEq(st.balanceOf(OWNER), 0, "full exit when liquidity covers it");
+        assertLe(builder.balance, MAX_TIP);
+        assertEq(address(exitC).balance, 0);
+    }
+}
