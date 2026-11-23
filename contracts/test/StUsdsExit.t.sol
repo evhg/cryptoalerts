@@ -2,6 +2,7 @@
 pragma solidity 0.8.28;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {Vm, VmSafe} from "forge-std/Vm.sol";
 import {StUsdsExit} from "../src/StUsdsExit.sol";
 
 interface IStUsds {
@@ -435,6 +436,79 @@ contract StUsdsExitTest is Test {
         assertEq(st.balanceOf(OWNER), sharesBefore);
         assertEq(st.balanceOf(keeper), 0);
         assertEq(usds.balanceOf(keeper), 0);
+    }
+
+    // ---------- Sky only, exactly what is available ----------
+
+    /// Records every account the exit contract touches during a real exit and
+    /// proves the only contract it talks to is Sky's stUSDS (plus paying the
+    /// builder tip and refunding the keeper). No DEX, router or aggregator.
+    function test_onlyEverCallsSkyStUsds() public {
+        _fork(NEXT_BLOCK); // partial liquidity, the realistic case
+        _approveAll();
+        vm.startStateDiffRecording();
+        vm.prank(keeper);
+        exitC.exit{value: MAX_TIP}(type(uint256).max, 0);
+        Vm.AccountAccess[] memory accesses = vm.stopAndReturnStateDiff();
+        // stUSDS is an ERC-1967 proxy; its own forwarding to its implementation
+        // shows up with our contract as msg.sender. That hop is still Sky.
+        address stUsdsImpl = address(uint160(uint256(vm.load(ST_USDS, 0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc))));
+        uint256 stUsdsCalls;
+        for (uint256 i = 0; i < accesses.length; i++) {
+            Vm.AccountAccess memory a = accesses[i];
+            if (a.accessor != address(exitC)) continue;
+            bool isCall = a.kind == VmSafe.AccountAccessKind.Call || a.kind == VmSafe.AccountAccessKind.StaticCall
+                || a.kind == VmSafe.AccountAccessKind.DelegateCall || a.kind == VmSafe.AccountAccessKind.CallCode
+                || a.kind == VmSafe.AccountAccessKind.Create;
+            if (!isCall) continue;
+            if (a.account == ST_USDS || (a.account == stUsdsImpl && a.kind == VmSafe.AccountAccessKind.DelegateCall)) {
+                stUsdsCalls++;
+                continue;
+            }
+            // Plain ETH transfers only: the builder tip and the keeper refund.
+            assertTrue(a.account == builder || a.account == keeper, "exit contract called something other than stUSDS");
+            assertEq(a.data.length, 0, "ETH transfers carry no calldata");
+            assertTrue(a.kind == VmSafe.AccountAccessKind.Call, "no delegatecall or create");
+        }
+        assertGt(stUsdsCalls, 0);
+    }
+
+    /// The contract's own code has no opcode that could hand control to other
+    /// code or create contracts: no DELEGATECALL, CALLCODE, CREATE, CREATE2 or
+    /// SELFDESTRUCT. Its only outward calls are the three to stUSDS plus the
+    /// two plain ETH transfers checked above.
+    function test_bytecodeHasNoDelegatecallCreateOrSelfdestruct() public {
+        _fork(DRY_BLOCK);
+        bytes memory code = address(exitC).code;
+        assertGt(code.length, 0);
+        uint256 calls;
+        for (uint256 i = 0; i < code.length; i++) {
+            uint8 op = uint8(code[i]);
+            if (op >= 0x60 && op <= 0x7f) {
+                i += op - 0x5f; // skip PUSH data
+                continue;
+            }
+            assertTrue(op != 0xf4 && op != 0xf2 && op != 0xf0 && op != 0xf5 && op != 0xff, "forbidden opcode");
+            if (op == 0xf1) calls++;
+        }
+        // CALL sites: stUSDS.redeem, builder tip, keeper refund (views use STATICCALL).
+        assertEq(calls, 3, "exactly three CALL sites");
+    }
+
+    /// The redemption takes exactly what Sky reports as withdrawable for this
+    /// owner, at the vault's own share price: never more, and no slippage.
+    function test_takesExactlyWhatSkyHasAvailable() public {
+        _fork(NEXT_BLOCK);
+        _approveAll();
+        uint256 available = st.maxWithdraw(OWNER); // Sky's own figure
+        uint256 sharesBefore = st.balanceOf(OWNER);
+        vm.prank(keeper);
+        uint256 assets = exitC.exit(type(uint256).max, 0);
+        uint256 sharesBurned = sharesBefore - st.balanceOf(OWNER);
+        assertLe(assets, available, "never more than Sky has available");
+        assertApproxEqAbs(assets, available, 1e12, "and all of it (within rounding of a millionth of a cent)");
+        assertApproxEqAbs(assets, st.convertToAssets(sharesBurned), 1e12, "no slippage: NAV price");
+        assertLt(st.maxWithdraw(OWNER), 1e12, "nothing left that Sky would pay out");
     }
 
     // ---------- arbitrary liquidity ----------

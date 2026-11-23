@@ -219,6 +219,20 @@ async function signTx(account: PrivateKeyAccount, req: TxReq, priorityGwei: numb
   return { raw, hash: keccak256(raw), head, nonce: n, maxFeePerGas }
 }
 
+/** ETH an account needs to send a transaction with this gas limit at today's fees (as signTx prices it). */
+async function gasBudget(gas: bigint) {
+  const head = await client.getBlock()
+  return gas * ((head.baseFeePerGas ?? 0n) * 2n + parseGwei('1.5'))
+}
+
+/** Make sure `to` can pay for a transaction of `gas`, topping it up from the keeper if not. */
+async function ensureGas(ctx: Ctx, to: Hex, gas: bigint) {
+  const need = await gasBudget(gas)
+  const have = await client.getBalance({ address: to })
+  if (have >= need) return
+  await sendPublic(ctx.keeper!, { to, value: need - have + need / 10n, gas: 21_000n })
+}
+
 /** Ordinary public transaction (setup steps only - never used for the exit itself). */
 async function sendPublic(account: PrivateKeyAccount, req: TxReq) {
   const { raw, hash } = await signTx(account, req, 1.5)
@@ -245,6 +259,24 @@ async function builderCall(b: (typeof BUILDERS)[number], signer: PrivateKeyAccou
   }
 }
 
+/** Send a transaction only as a bundle to builders (never the public mempool) and wait for it. */
+async function sendPrivate(account: PrivateKeyAccount, req: TxReq, priorityGwei: number) {
+  const { raw, hash, head } = await signTx(account, req, priorityGwei)
+  const targets = [head.number + 1n, head.number + 2n, head.number + 3n]
+  const sent = await Promise.all(
+    BUILDERS.flatMap((b) => targets.map((t) => builderCall(b, account, 'eth_sendBundle', [{ txs: [raw], blockNumber: toHex(t) }]))),
+  )
+  for (let i = 0; i < 24; i++) {
+    await sleep(2500)
+    const receipt = await client.getTransactionReceipt({ hash }).catch(() => null)
+    if (receipt) {
+      if (receipt.status !== 'success') throw new Error(`private transaction ${hash} reverted`)
+      return { receipt, sent }
+    }
+  }
+  throw new Error(`private transaction ${hash} not included in blocks ${targets.join(', ')}: ${JSON.stringify(sent).slice(0, 300)}`)
+}
+
 async function buildExit(ctx: Ctx) {
   const cfg = ctx.config
   const keeper = ctx.keeper!
@@ -255,8 +287,9 @@ async function buildExit(ctx: Ctx) {
     client.readContract({ address: helper, abi: exitAbi, functionName: 'redeemable' }),
     client.getBalance({ address: keeper.address }),
   ])
-  // Keep enough ETH back to pay for gas at a generous fee.
-  const reserve = gas * parseGwei('20')
+  // Keep back exactly what this transaction may be charged for gas (signTx's max fee).
+  const head = await client.getBlock()
+  const reserve = gas * ((head.baseFeePerGas ?? 0n) * 2n + parseGwei(String(cfg.priority_gwei ?? 2)))
   let tip = parseGwei(String(cfg.tip_gwei ?? 0))
   if (balance < reserve) tip = 0n
   else if (tip > balance - reserve) tip = balance - reserve
@@ -470,10 +503,7 @@ async function approveTest(ctx: Ctx) {
   const t = ctx.testOwner!
   const { helper, owner } = await verifyHelper(ctx)
   if (owner !== t.address) throw new Error('configured helper does not belong to the test wallet')
-  const need = parseEther('0.0003')
-  if ((await client.getBalance({ address: t.address })) < need) {
-    await sendPublic(ctx.keeper!, { to: t.address, value: need, gas: 21_000n })
-  }
+  await ensureGas(ctx, t.address, 80_000n)
   const data = encodeFunctionData({ abi: tokenAbi, functionName: 'approve', args: [helper, maxUint256] })
   const r = await sendPublic(t, { to: ST_USDS, data, gas: 80_000n })
   return { approved: helper, tx: r.transactionHash }
@@ -487,9 +517,12 @@ async function drill(ctx: Ctx, body: any) {
   if (allowance < amount) {
     await sendPublic(k, { to: USDS, data: encodeFunctionData({ abi: tokenAbi, functionName: 'approve', args: [ST_USDS, maxUint256] }), gas: 80_000n })
   }
-  const r = await sendPublic(k, { to: ST_USDS, data: encodeFunctionData({ abi: tokenAbi, functionName: 'deposit', args: [amount, k.address] }), gas: 450_000n })
-  await log(ctx, r.blockNumber, 'drill_deposit', { usds: body.usds, tx: r.transactionHash, index: r.transactionIndex })
-  return { deposited_usds: body.usds, block: r.blockNumber, index: r.transactionIndex, tx: r.transactionHash }
+  const req = { to: ST_USDS as Hex, data: encodeFunctionData({ abi: tokenAbi, functionName: 'deposit', args: [amount, k.address] }), gas: 450_000n }
+  // A public deposit is backrun in the same block by mempool bots; a private one
+  // only becomes visible once its block is out, which is the race the exit bot runs.
+  const r = body.private ? (await sendPrivate(k, req, 2)).receipt : await sendPublic(k, req)
+  await log(ctx, r.blockNumber, 'drill_deposit', { usds: body.usds, private: !!body.private, tx: r.transactionHash, index: r.transactionIndex })
+  return { deposited_usds: body.usds, private: !!body.private, block: r.blockNumber, index: r.transactionIndex, tx: r.transactionHash }
 }
 
 /** Return test funds to the main wallet. The destination is fixed. */
@@ -500,9 +533,7 @@ async function sweep(ctx: Ctx, body: any) {
     for (const token of [USDS, ST_USDS] as Hex[]) {
       const bal = await client.readContract({ address: token, abi: tokenAbi, functionName: 'balanceOf', args: [acct.address] })
       if (bal === 0n) continue
-      if ((await client.getBalance({ address: acct.address })) < parseEther('0.0002') && acct !== ctx.keeper) {
-        await sendPublic(ctx.keeper!, { to: acct.address, value: parseEther('0.0003'), gas: 21_000n })
-      }
+      if (acct !== ctx.keeper) await ensureGas(ctx, acct.address, 120_000n)
       const r = await sendPublic(acct, { to: token, data: encodeFunctionData({ abi: tokenAbi, functionName: 'transfer', args: [MAIN_WALLET, bal] }), gas: 120_000n })
       done.push({ from: acct.address, token, amount: formatUnits(bal, 18), tx: r.transactionHash })
     }
