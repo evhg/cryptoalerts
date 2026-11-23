@@ -59,8 +59,10 @@ route (see `20261123000200_stusds_alert_push_and_key.sql`).
 
 An alert also sends a Web Push through the sleep-lab app's own sender
 (`private.jarvis_push`), which reaches every device subscribed to Jarvis
-notifications. Turn it off with `update stusds_alert.config set push_enabled = false`. `RPC_ENDPOINTS` (optional secret, JSON array of
-`{"name","http","ws"}`) replaces the public RPC endpoints with your own.
+notifications. Turn it off with `update stusds_alert.config set push_enabled = false`.
+
+`RPC_ENDPOINTS` (optional secret, JSON array of `{"name","http","ws"}`)
+replaces the public RPC endpoints with your own.
 
 ### Checking on it
 
