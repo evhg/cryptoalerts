@@ -107,3 +107,20 @@ After any exit, start it again; arming state persists in `~/.stusds-watch`,
 so a restart does not repeat an alert. On ALERT, check `last_alert.email_ok`
 on the health endpoint: if the deployed watcher did not get the email out,
 send it from the session instead.
+
+## stUSDS exit bot and arb (`supabase/functions/stusds-exit`)
+
+Gets the main wallet's stUSDS out at Sky's 1:1 redemption value whenever liquidity frees up, and puts any liquidity left after that to work in a risk-free arb whose profit goes to the main wallet.
+
+Contracts (`contracts/src`, fork tests in `contracts/test`):
+- `StUsdsExit` — redeems the owner's stUSDS to the owner, only what Sky can pay, tip to the builder capped and paid from the caller's ETH. Main wallet: `0xbF54F2AA78b4c240e34224073aff9E89Cd915897`; test wallet: `0x01662b082432859c366ab16362eab10fb72c73e6`. The owner arms it with one `approve` on stUSDS (see `contracts/review/` for the second-opinion packet and an independent bytecode check).
+- `StUsdsArb` — flash-mints DAI, buys stUSDS below its redemption value through the KyberSwap router, redeems it at Sky, repays, tips the builder out of profit (checked against Chainlink) and sends the rest to the main wallet. Holds nothing between transactions and has no approval on anyone's funds. Deployed at `0xa2749a6d8de66523c9132d964b5c61d363a5fbe3`.
+
+Three routes, each sending the same bundle — the exit first, then the arb on what is left, plus a fallback bundle without the arb:
+- end of block (`fire`, from the block observer);
+- Safe route (`tick`, every ~5 s): a fully signed repayment in a watched borrower Safe is executed by the bot with its transactions right behind it;
+- backrun (`mempool`, pending-transaction feed): public repayments and stUSDS deposits.
+
+Settings (`stusds_alert.exit_config`): `enabled`, `target_name`/`helper_address`, `fee_bps` (exit fee cap, default 10 = 0.1%), `fee_floor_usd`, `safe_route`, `watch_safe` (comma-separated), `arb_enabled`, `arb_address`, `arb_tip_share_safe` (0.3), `arb_tip_share_race` (0.7), `arb_min_net_usd` (25), `mempool_enabled`.
+
+Tests: `cd contracts && forge test` (42 fork tests; `node test/fixtures/build-arb-fixture.mjs` refreshes the Kyber calldata fixture), `deno run --allow-net supabase/functions/stusds-exit/pending_test.ts` (pending-transaction decoder against real transactions).

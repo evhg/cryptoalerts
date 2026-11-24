@@ -1,18 +1,23 @@
 // stUSDS exit bot - Supabase edge function.
 //
-// Fires a private, revert-protected redemption through the owner's StUsdsExit
-// contract when the block observer reports withdrawable liquidity, and watches
-// a Safe's public transaction queue for repayments that are about to land.
+// Three ways to the liquidity, each building the same bundle: the owner's
+// exit first (StUsdsExit, 1:1 at Sky, fee capped at 0.1%), then an arb on
+// whatever is left (StUsdsArb, profit to the main wallet only):
+//  - end of block: the block observer reports withdrawable USDS (`fire`);
+//  - Safe route: a fully signed repayment in a big borrower's Safe queue,
+//    executed by us with our transactions right behind it (`tick`);
+//  - backrun: a public repayment or deposit seen while pending (`mempool`).
 //
 // Every route is a POST authenticated by the secret pg_cron/pg_net send
 // (checked in Postgres). Keys are generated here, stored in Vault and never
 // returned by any route.
 //
 // Safety properties this function relies on:
-//  - The exit contract can only pay the owner it was deployed for, so a
-//    mistake here cannot send funds anywhere else.
-//  - Withdrawals are sent only as single-transaction bundles straight to block
-//    builders: a transaction that would revert is not included and costs nothing.
+//  - The exit contract can only pay the owner it was deployed for, and the arb
+//    contract only the main wallet, so a mistake here cannot send funds anywhere else.
+//  - Both contracts are checked byte-for-byte against the tested builds before use.
+//  - Everything goes to block builders as bundles, simulated first: a bundle
+//    that would revert is not included and costs nothing.
 //  - `sweep` can only send to MAIN_WALLET.
 
 import {
@@ -37,6 +42,8 @@ import {
 import { generatePrivateKey, type PrivateKeyAccount, privateKeyToAccount } from 'npm:viem@2.58.4/accounts'
 import { mainnet } from 'npm:viem@2.58.4/chains'
 import { EXIT_CREATION_BYTECODE } from './bytecode.ts'
+import { arbDeployData, availableUsds, planArb, verifyArb } from './arb.ts'
+import { freedBy, freedByExact } from './pending.ts'
 
 declare const EdgeRuntime: { waitUntil(p: Promise<unknown>): void } | undefined
 
@@ -252,7 +259,7 @@ async function sendPublic(account: PrivateKeyAccount, req: TxReq) {
   return receipt
 }
 
-async function builderCall(b: (typeof BUILDERS)[number], signer: PrivateKeyAccount, method: string, params: unknown[]) {
+async function builderCall(b: (typeof BUILDERS)[number], signer: PrivateKeyAccount, method: string, params: unknown[], fullBody = false) {
   const body = JSON.stringify({ jsonrpc: '2.0', id: 1, method, params })
   const headers: Record<string, string> = { 'content-type': 'application/json' }
   if (b.sign) {
@@ -263,7 +270,8 @@ async function builderCall(b: (typeof BUILDERS)[number], signer: PrivateKeyAccou
   try {
     const res = await fetch(b.url, { method: 'POST', headers, body, signal: AbortSignal.timeout(4000) })
     const text = await res.text()
-    return { builder: b.name, status: res.status, ms: Date.now() - started, body: text.slice(0, 200) }
+    // Simulations need the whole reply; submissions only keep a short excerpt for the log.
+    return { builder: b.name, status: res.status, ms: Date.now() - started, body: fullBody ? text : text.slice(0, 200) }
   } catch (e) {
     return { builder: b.name, error: String(e).slice(0, 120), ms: Date.now() - started }
   }
@@ -361,94 +369,226 @@ async function feePlan(cfg: any, expectedWad: bigint, gasUnits: bigint, keeperBa
   return plan
 }
 
-/** The main path: liquidity is there, send the exit privately for the next blocks. */
+// ---------- bundles ----------
+
+type Sim = { ok: boolean; results: { error?: string; value?: string; gasUsed?: number }[]; raw?: unknown }
+
+/** Simulate a bundle exactly as builders would run it (Flashbots eth_callBundle). */
+async function simulateBundle(ctx: Ctx, raws: Hex[]): Promise<Sim> {
+  if (LOCAL_SUBMIT) return await localSimulate(ctx, raws)
+  const head = await client.getBlock()
+  const fb = BUILDERS.find((b) => b.name === 'flashbots')!
+  const sim = await builderCall(fb, ctx.keeper!, 'eth_callBundle', [{ txs: raws, blockNumber: toHex(head.number + 1n), stateBlockNumber: 'latest' }], true)
+  let parsed: any = null
+  try {
+    parsed = JSON.parse(sim.body ?? '')
+  } catch { /* below */ }
+  const results = parsed?.result?.results
+  if (!Array.isArray(results)) return { ok: false, results: [], raw: { status: sim.status, error: sim.error, body: String(sim.body ?? '').slice(0, 300) } }
+  const out = results.map((r: any) => ({
+    error: r.error ? `${r.error}${r.revert ? `: ${r.revert}` : ''}` : undefined,
+    value: r.value && r.value !== '0x' ? String(r.value) : undefined,
+    gasUsed: Number(r.gasUsed ?? 0),
+  }))
+  return { ok: out.length === raws.length && out.every((r: any) => !r.error), results: out }
+}
+
+/** Fork rehearsals only: emulate eth_callBundle on an anvil fork (snapshot, run in order, revert). */
+async function localSimulate(ctx: Ctx, raws: Hex[]): Promise<Sim> {
+  const call = async (method: string, params: unknown[]) => {
+    const r = await fetch(RPC_URLS[0], { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }) })
+    const j = await r.json()
+    if (j.error) throw new Error(j.error.message)
+    return j.result
+  }
+  // The "return value" of each transaction is the USDS it delivered to the wallets the bot serves.
+  const watch = [MAIN_WALLET, ctx.testOwner?.address].filter(Boolean) as Hex[]
+  const usdsOf = async () =>
+    (await Promise.all(watch.map((a) => client.readContract({ address: USDS, abi: tokenAbi, functionName: 'balanceOf', args: [a] })))).reduce((s, x) => s + x, 0n)
+  await call('anvil_dropAllTransactions', []).catch(() => null)
+  const snap = await call('evm_snapshot', [])
+  const results: Sim['results'] = []
+  try {
+    for (const raw of raws) {
+      const before = await usdsOf()
+      let hash: Hex
+      try {
+        hash = await call('eth_sendRawTransaction', [raw])
+      } catch (e) {
+        results.push({ error: String(e).slice(0, 200) })
+        break
+      }
+      const rc = await client.waitForTransactionReceipt({ hash, timeout: 30_000, pollingInterval: 200 })
+      const after = await usdsOf()
+      let reason = 'reverted'
+      if (rc.status !== 'success') {
+        const tr = await call('debug_traceTransaction', [hash, { tracer: 'callTracer' }]).catch(() => null)
+        reason = `reverted: ${tr?.error ?? ''} ${String(tr?.output ?? '').slice(0, 74)} gas ${rc.gasUsed}/${tr?.gas ?? '?'}`
+      }
+      results.push(rc.status === 'success' ? { value: toHex(after - before), gasUsed: Number(rc.gasUsed) } : { error: reason, gasUsed: Number(rc.gasUsed) })
+      if (rc.status !== 'success') break
+    }
+  } finally {
+    await call('evm_revert', [snap])
+    await call('anvil_dropAllTransactions', []).catch(() => null)
+  }
+  return { ok: results.length === raws.length && results.every((r) => !r.error), results }
+}
+
+/** Send each bundle to every builder for each target block (on a fork: run the first bundle). */
+async function sendBundles(signer: PrivateKeyAccount, bundles: Hex[][], targets: bigint[], publicRaw?: Hex) {
+  if (LOCAL_SUBMIT) {
+    const out: any[] = []
+    for (const raw of bundles[0]) out.push({ builder: 'local-fork', status: 200, body: await client.sendRawTransaction({ serializedTransaction: raw }).catch((e) => String(e).slice(0, 120)) })
+    return out
+  }
+  return await Promise.all([
+    ...BUILDERS.flatMap((b) => targets.flatMap((t) => bundles.map((txs) => builderCall(b, signer, 'eth_sendBundle', [{ txs, blockNumber: toHex(t) }])))),
+    ...(publicRaw ? PUBLIC_MEMPOOL.map((u) => publicSend(u, publicRaw)) : []),
+  ])
+}
+
+const sendOk = (s: any) => s.status === 200 && !String(s.body ?? '').includes('"error"')
+const summarizeSends = (sent: any[]) => ({
+  accepted_by: [...new Set(sent.filter(sendOk).map((s) => s.builder))],
+  requests: sent.length,
+  failures: sent.filter((s) => !sendOk(s)).slice(0, 4),
+})
+
+type Leg = { raw: Hex; hash: Hex; expected: bigint; detail: Record<string, unknown> }
+type Skip = { skipped: string; [k: string]: unknown }
+const isLeg = (x: Leg | Skip): x is Leg => 'raw' in x
+
+/**
+ * The owner's exit as the next transaction after `preceding`, tipped within the
+ * fee policy (gas of `extraGas` the bot also pays for counts against it).
+ */
+async function exitLeg(ctx: Ctx, preceding: Hex[], nonce: number, extraGas = 0n): Promise<Leg | Skip> {
+  const cfg = ctx.config
+  if (!cfg.helper_address) return { skipped: 'no exit contract' }
+  const x = await buildExit(ctx)
+  const prio = Number(cfg.priority_gwei ?? 1)
+  let expected: bigint
+  if (!preceding.length) {
+    if (x.shares === 0n) return { skipped: 'nothing redeemable' }
+    try {
+      expected = (await client.simulateContract({ address: x.helper, abi: exitAbi, functionName: 'exit', args: [maxUint256, x.minAssets], account: x.keeper.address, value: 0n })).result
+    } catch (e) {
+      return { skipped: 'exit simulation reverted', error: String(e).slice(0, 200) }
+    }
+  } else {
+    const probe = await signTx(x.keeper, { to: x.helper, data: x.data, value: 0n, gas: x.gas }, prio, nonce)
+    const sim = await simulateBundle(ctx, [...preceding, probe.raw])
+    const r = sim.results[preceding.length]
+    if (!sim.ok || !r?.value) return { skipped: 'exit gets nothing after the preceding transactions', error: r?.error ?? (sim.raw ? JSON.stringify(sim.raw).slice(0, 200) : undefined) }
+    expected = BigInt(r.value)
+  }
+  const plan = await feePlan(cfg, expected, EXIT_GAS_USED + extraGas, x.balance, x.gas + extraGas)
+  if (!plan.ok) return { skipped: plan.reason, expected_usds: formatUnits(expected, 18) }
+  const signed = await signTx(x.keeper, { to: x.helper, data: x.data, value: plan.tipWei, gas: x.gas }, prio, nonce)
+  return {
+    raw: signed.raw,
+    hash: signed.hash,
+    expected,
+    detail: { hash: signed.hash, nonce, expected_usds: formatUnits(expected, 18), tip_eth: formatEther(plan.tipWei), fee_budget_usd: plan.budgetUsd, gas_usd: plan.gasUsd },
+  }
+}
+
+/** The arb on whatever liquidity is left after `preceding`. Profit only ever goes to the main wallet. */
+async function arbLeg(ctx: Ctx, preceding: Hex[], availableWad: bigint, nonce: number, tipShare: number): Promise<Leg | Skip> {
+  const cfg = ctx.config
+  if (!cfg.arb_enabled || !cfg.arb_address || !ctx.keeper) return { skipped: 'arb off' }
+  if (availableWad < parseUnits('2000', 18)) return { skipped: 'too little liquidity for an arb', available_usds: formatUnits(availableWad > 0n ? availableWad : 0n, 18) }
+  try {
+    const arb = await verifyArb(client as any, getAddress(cfg.arb_address), getAddress(MAIN_WALLET), ctx.keeper.address)
+    const prio = Number(cfg.priority_gwei ?? 1)
+    const r: any = await planArb({
+      client: client as any,
+      arb,
+      availableWad,
+      preceding,
+      sign: (to, data, gas) => signTx(ctx.keeper!, { to, data, gas }, prio, nonce),
+      simulate: (raws) => simulateBundle(ctx, raws),
+      tipShare,
+      minNetUsds: Number(cfg.arb_min_net_usd ?? 25),
+    })
+    if (!r.raw) return { skipped: r.skipped ?? 'no plan', ...r }
+    const { raw, hash, ...rest } = r
+    return { raw, hash, expected: 0n, detail: { hash, nonce, ...rest } }
+  } catch (e) {
+    return { skipped: String(e).slice(0, 200) }
+  }
+}
+
+/** Wait for whichever of our transactions lands, log it and tell the user. */
+async function watchLanding(ctx: Ctx, seenBlock: number, route: string, exit: Leg | null, arb: Leg | null) {
+  const cfg = ctx.config
+  const pending = new Map<Hex, 'exit' | 'arb'>()
+  if (exit) pending.set(exit.hash, 'exit')
+  if (arb) pending.set(arb.hash, 'arb')
+  for (let i = 0; i < 20 && pending.size; i++) {
+    await sleep(2500)
+    for (const [hash, kind] of [...pending]) {
+      const receipt = await client.getTransactionReceipt({ hash }).catch(() => null)
+      if (!receipt) continue
+      pending.delete(hash)
+      const detail = { route, kind, hash, block: Number(receipt.blockNumber), index: receipt.transactionIndex, status: receipt.status, gas_used: Number(receipt.gasUsed), blocks_after_seen: Number(receipt.blockNumber) - seenBlock }
+      await log(ctx, receipt.blockNumber, 'included', detail)
+      if (kind === 'exit') {
+        await notify(
+          ctx,
+          'stusds:exit',
+          receipt.status === 'success' ? `stUSDS withdrawal landed (${route})` : `stUSDS withdrawal reverted on-chain (${route})`,
+          `${usd(exit!.expected)} USDS expected, block ${receipt.blockNumber} position ${receipt.transactionIndex} (${cfg.target_name}). https://etherscan.io/tx/${hash}`,
+        )
+      } else if (receipt.status === 'success') {
+        await notify(ctx, 'stusds:arb', `stUSDS arb landed (${route})`, `About ${Number(arb!.detail.net ?? 0).toLocaleString('en-US', { maximumFractionDigits: 0 })} USDS profit sent to the main wallet, block ${receipt.blockNumber}. https://etherscan.io/tx/${hash}`)
+      }
+    }
+  }
+  if (pending.size) await log(ctx, seenBlock, 'not_included', { route, hashes: [...pending.keys()] })
+}
+
+/** Liquidity is there at the end of a block: the exit first, then the arb on whatever is left. */
 async function fire(ctx: Ctx, seenBlock: number) {
   const started = Date.now()
   const cfg = ctx.config
-  if (!cfg.enabled || !cfg.helper_address || !ctx.keeper) return { skipped: 'not armed' }
-  const x = await buildExit(ctx)
-  if (x.shares === 0n) {
-    await log(ctx, seenBlock, 'nothing_redeemable', { ms: Date.now() - started })
-    return { skipped: 'nothing redeemable' }
-  }
-  let expected: bigint
-  try {
-    const sim = await client.simulateContract({
-      address: x.helper,
-      abi: exitAbi,
-      functionName: 'exit',
-      args: [maxUint256, x.minAssets],
-      account: x.keeper.address,
-      value: 0n,
-    })
-    expected = sim.result
-  } catch (e) {
-    await log(ctx, seenBlock, 'simulation_reverted', { error: String(e).slice(0, 300), ms: Date.now() - started })
-    return { skipped: 'simulation reverted' }
-  }
-
-  const plan = await feePlan(cfg, expected, EXIT_GAS_USED, x.balance, x.gas)
-  if (!plan.ok) {
-    await log(ctx, seenBlock, 'over_fee_budget', { expected_usds: formatUnits(expected, 18), ...plan, tipWei: undefined })
-    return { skipped: plan.reason }
-  }
-  const tip = plan.tipWei
-
+  if (!cfg.enabled || !ctx.keeper) return { skipped: 'not armed' }
+  const keeper = ctx.keeper
   // Always the confirmed nonce: a still-pending public copy of an earlier attempt
   // must be replaced, not queued behind (builders drop bundles with a nonce gap).
-  const confirmedNonce = await client.getTransactionCount({ address: x.keeper.address, blockTag: 'latest' })
-  const { raw, hash, head, nonce } = await signTx(x.keeper, { to: x.helper, data: x.data, value: tip, gas: x.gas }, Number(cfg.priority_gwei ?? 1), confirmedNonce)
+  const [n, head, available] = await Promise.all([
+    client.getTransactionCount({ address: keeper.address, blockTag: 'latest' }),
+    client.getBlock(),
+    availableUsds(client as any),
+  ])
+  const exit = await exitLeg(ctx, [], n)
+  const arb = await arbLeg(ctx, isLeg(exit) ? [exit.raw] : [], available - (isLeg(exit) ? exit.expected : 0n), isLeg(exit) ? n + 1 : n, Number(cfg.arb_tip_share_race ?? 0.7))
+  if (!isLeg(exit) && !isLeg(arb)) {
+    await log(ctx, seenBlock, 'nothing_to_do', { exit, arb, available_usds: formatUnits(available, 18), ms: Date.now() - started })
+    return { skipped: 'nothing to do' }
+  }
+  const bundles: Hex[][] = []
+  if (isLeg(exit) && isLeg(arb)) bundles.push([exit.raw, arb.raw])
+  if (isLeg(exit)) bundles.push([exit.raw])
+  else if (isLeg(arb)) bundles.push([arb.raw])
   const targets = [head.number + 1n, head.number + 2n, head.number + 3n]
-  const sent = LOCAL_SUBMIT
-    ? [{ builder: 'local-fork', body: await client.sendRawTransaction({ serializedTransaction: raw }) }]
-    : await Promise.all([
-      ...BUILDERS.flatMap((b) => targets.map((t) => builderCall(b, x.keeper, 'eth_sendBundle', [{ txs: [raw], blockNumber: toHex(t) }]))),
-      // Some validators build their own blocks from the public mempool, which no
-      // bundle can reach. A public copy covers those. If it is beaten it just
-      // reverts (no tip is paid on failure, only roughly 50-80k gas).
-      ...(cfg.public_broadcast ? PUBLIC_MEMPOOL.map((u) => publicSend(u, raw)) : []),
-    ])
-  const sentMs = Date.now() - started
+  // Some validators build their own blocks from the public mempool, which no bundle
+  // reaches. A public copy of the exit covers those (beaten, it just reverts cheaply).
+  const sent = await sendBundles(keeper, bundles, targets, cfg.public_broadcast && isLeg(exit) ? exit.raw : undefined)
   await log(ctx, seenBlock, 'fired', {
-    hash,
-    nonce,
+    route: 'end_of_block',
     head: Number(head.number),
     head_age_ms: Date.now() - Number(head.timestamp) * 1000,
     targets: targets.map(Number),
-    expected_usds: formatUnits(expected, 18),
-    tip_eth: formatEther(tip),
-    fee_budget_usd: plan.budgetUsd,
-    gas_usd: plan.gasUsd,
-    ms: sentMs,
-    builders: sent,
+    available_usds: formatUnits(available, 18),
+    exit: isLeg(exit) ? exit.detail : exit,
+    arb: isLeg(arb) ? arb.detail : arb,
+    ms: Date.now() - started,
+    builders: summarizeSends(sent),
   })
-
-  // Did it land?
-  for (let i = 0; i < 20; i++) {
-    await sleep(2500)
-    const receipt = await client.getTransactionReceipt({ hash }).catch(() => null)
-    if (receipt) {
-      const detail = {
-        hash,
-        block: Number(receipt.blockNumber),
-        index: receipt.transactionIndex,
-        status: receipt.status,
-        gas_used: Number(receipt.gasUsed),
-        expected_usds: formatUnits(expected, 18),
-        blocks_after_seen: Number(receipt.blockNumber) - seenBlock,
-      }
-      await log(ctx, receipt.blockNumber, 'included', detail)
-      await notify(
-        ctx,
-        'stusds:exit',
-        receipt.status === 'success' ? 'stUSDS withdrawal landed' : 'stUSDS withdrawal reverted on-chain',
-        `${usd(expected)} USDS expected, block ${receipt.blockNumber} position ${receipt.transactionIndex} (${cfg.target_name}). https://etherscan.io/tx/${hash}`,
-      )
-      return detail
-    }
-  }
-  await log(ctx, seenBlock, 'not_included', { hash, targets: targets.map(Number) })
-  return { hash, included: false }
+  await watchLanding(ctx, seenBlock, 'end of block', isLeg(exit) ? exit : null, isLeg(arb) ? arb : null)
+  return { fired: true }
 }
 
 // ---------- Safe queue watch ----------
@@ -482,7 +622,7 @@ const safeRouteSent = new Map<string, number>() // safeTxHash -> last block targ
 
 async function safeRoute(ctx: Ctx, safe: Hex, t: any, onchainNonce: bigint, threshold: bigint) {
   const cfg = ctx.config
-  if (!cfg.enabled || !cfg.safe_route || !ctx.keeper || !cfg.helper_address) return { skipped: 'not armed' }
+  if (!cfg.enabled || !cfg.safe_route || !ctx.keeper) return { skipped: 'not armed' }
   if (BigInt(t.nonce) !== onchainNonce) return { skipped: 'not next in the Safe queue' }
   const confs = [...(t.confirmations ?? [])].filter((c: any) => typeof c.signature === 'string' && c.signature.length === 132)
   if (BigInt(confs.length) < threshold) return { skipped: 'not fully signed' }
@@ -512,73 +652,32 @@ async function safeRoute(ctx: Ctx, safe: Hex, t: any, onchainNonce: bigint, thre
     return { skipped: 'Safe transaction simulation failed' }
   }
 
-  const x = await buildExit(ctx)
   const n = await client.getTransactionCount({ address: keeper.address, blockTag: 'latest' })
   const prio = Number(cfg.priority_gwei ?? 1)
   const exec = await signTx(keeper, { to: safe, data: execData, gas: execGas }, prio, n)
-
-  // How much would the exit get right after the repayment? Simulate the pair.
-  let expected: bigint
-  if (LOCAL_SUBMIT) {
-    // Local fork rehearsal only: no bundle simulator, so assume the whole approved position comes out.
-    const { owner } = await verifyHelper(ctx)
-    const [bal, allowed] = await Promise.all([
-      client.readContract({ address: ST_USDS, abi: tokenAbi, functionName: 'balanceOf', args: [owner] }),
-      client.readContract({ address: ST_USDS, abi: tokenAbi, functionName: 'allowance', args: [owner, x.helper] }),
-    ])
-    expected = await client.readContract({ address: ST_USDS, abi: tokenAbi, functionName: 'convertToAssets', args: [bal < allowed ? bal : allowed] })
-  } else {
-    const probe = await signTx(keeper, { to: x.helper, data: x.data, value: 0n, gas: x.gas }, prio, n + 1)
-    const fb = BUILDERS.find((b) => b.name === 'flashbots')!
-    const sim = await builderCall(fb, keeper, 'eth_callBundle', [{ txs: [exec.raw, probe.raw], blockNumber: toHex(head.number + 1n), stateBlockNumber: 'latest' }])
-    let parsed: any = null
-    try { parsed = JSON.parse(sim.body ?? '') } catch { /* below */ }
-    const results = parsed?.result?.results
-    if (!Array.isArray(results) || results.length !== 2 || results[0].error || results[1].error) {
-      await log(ctx, Number(head.number), 'safe_route_bundle_sim_failed', { safeTxHash: t.safeTxHash, sim })
-      return { skipped: 'bundle simulation failed' }
-    }
-    expected = BigInt(results[1].value)
+  // Our exit right behind the repayment, then the arb on whatever it leaves.
+  const exit = await exitLeg(ctx, [exec.raw], n + 1, execGas)
+  const repayWad = parseUnits(String(Math.floor(describeSafeTx(t).repay)), 18)
+  const available = (await availableUsds(client as any)) + repayWad - (isLeg(exit) ? exit.expected : 0n)
+  const arb = await arbLeg(ctx, isLeg(exit) ? [exec.raw, exit.raw] : [exec.raw], available, isLeg(exit) ? n + 2 : n + 1, Number(cfg.arb_tip_share_safe ?? 0.3))
+  if (!isLeg(exit) && !isLeg(arb)) {
+    await log(ctx, Number(head.number), 'safe_route_nothing', { safeTxHash: t.safeTxHash, exit, arb })
+    return { skipped: 'nothing for us after this repayment' }
   }
-
-  const plan = await feePlan(cfg, expected, execGas + EXIT_GAS_USED, x.balance, execGas + x.gas)
-  if (!plan.ok) {
-    await log(ctx, Number(head.number), 'over_fee_budget', { route: 'safe', expected_usds: formatUnits(expected, 18), ...plan, tipWei: undefined })
-    return { skipped: plan.reason }
-  }
-  const exit = await signTx(keeper, { to: x.helper, data: x.data, value: plan.tipWei, gas: x.gas }, prio, n + 1)
+  const bundles: Hex[][] = []
+  if (isLeg(exit) && isLeg(arb)) bundles.push([exec.raw, exit.raw, arb.raw])
+  if (isLeg(exit)) bundles.push([exec.raw, exit.raw])
+  else if (isLeg(arb)) bundles.push([exec.raw, arb.raw])
   const targets = [head.number + 1n, head.number + 2n, head.number + 3n]
-  const sent = LOCAL_SUBMIT
-    ? [
-      { builder: 'local-fork', body: await client.sendRawTransaction({ serializedTransaction: exec.raw }) },
-      { builder: 'local-fork', body: await client.sendRawTransaction({ serializedTransaction: exit.raw }) },
-    ]
-    // Never public: their signed transaction goes only to builders, inside our bundle.
-    : await Promise.all(
-      BUILDERS.flatMap((b) => targets.map((tb) => builderCall(b, keeper, 'eth_sendBundle', [{ txs: [exec.raw, exit.raw], blockNumber: toHex(tb) }]))),
-    )
+  // Never public: their signed transaction goes only to builders, inside our bundle.
+  const sent = await sendBundles(keeper, bundles, targets)
   safeRouteSent.set(t.safeTxHash, Number(head.number) + 2)
-  const detail = {
-    safeTxHash: t.safeTxHash, safe_nonce: Number(onchainNonce), exec_hash: exec.hash, exit_hash: exit.hash,
-    targets: targets.map(Number), expected_usds: formatUnits(expected, 18), tip_eth: formatEther(plan.tipWei),
-    fee_budget_usd: plan.budgetUsd, gas_usd: plan.gasUsd, builders: sent,
-  }
-  await log(ctx, Number(head.number), 'safe_route_fired', detail)
-  for (let i = 0; i < 16; i++) {
-    await sleep(2500)
-    const receipt = await client.getTransactionReceipt({ hash: exit.hash }).catch(() => null)
-    if (receipt) {
-      await log(ctx, receipt.blockNumber, 'safe_route_included', { exit_hash: exit.hash, block: Number(receipt.blockNumber), index: receipt.transactionIndex, status: receipt.status })
-      await notify(
-        ctx,
-        'stusds:exit',
-        receipt.status === 'success' ? 'stUSDS withdrawal landed (Safe route)' : 'stUSDS withdrawal reverted (Safe route)',
-        `${usd(expected)} USDS expected, right behind the Safe repayment in block ${receipt.blockNumber} (${cfg.target_name}). https://etherscan.io/tx/${exit.hash}`,
-      )
-      return detail
-    }
-  }
-  return detail
+  await log(ctx, Number(head.number), 'safe_route_fired', {
+    safeTxHash: t.safeTxHash, safe, safe_nonce: Number(onchainNonce), exec_hash: exec.hash, targets: targets.map(Number),
+    repay_usds: formatUnits(repayWad, 18), exit: isLeg(exit) ? exit.detail : exit, arb: isLeg(arb) ? arb.detail : arb, builders: summarizeSends(sent),
+  })
+  await watchLanding(ctx, Number(head.number), 'Safe route', isLeg(exit) ? exit : null, isLeg(arb) ? arb : null)
+  return { fired: true }
 }
 
 /**
@@ -639,7 +738,11 @@ async function tick(ctx: Ctx) {
   if (!safes.length) return
   const failures: Record<string, string> = {}
   let polls = 0
-  for (let i = 0; i < 3; i++) {
+  // pg_cron starts this once a minute; poll every ~5 s for the next ~55 s, so a
+  // repayment that becomes fully signed is seen within seconds.
+  const until = Date.now() + 55_000
+  while (Date.now() < until) {
+    const roundStart = Date.now()
     for (const safe of safes) {
       polls++
       try {
@@ -649,10 +752,113 @@ async function tick(ctx: Ctx) {
         console.error('safe poll failed', safe, String(e))
       }
     }
-    if (i < 2) await sleep(20_000)
+    const wait = 5_000 - (Date.now() - roundStart)
+    if (Date.now() + wait < until) await sleep(Math.max(wait, 500))
+    else break
   }
   // A blind Safe watch must be visible: record any minute in which polling failed.
   if (Object.keys(failures).length) await log(ctx, null, 'safe_poll_failed', { polls, failures })
+}
+
+// ---------- pending-transaction watch (backruns) ----------
+//
+// Public repayments and deposits are seen before they are mined. We put our
+// exit and the arb directly behind them, as one bundle that only lands if the
+// repayment does, in the same block.
+
+const PENDING_WS = ['wss://ethereum-rpc.publicnode.com']
+async function rawTransaction(hash: Hex): Promise<Hex | null> {
+  for (const url of RPC_URLS) {
+    try {
+      const r = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_getRawTransactionByHash', params: [hash] }), signal: AbortSignal.timeout(2500) })
+      const j = await r.json()
+      if (j.result && j.result !== '0x') return j.result
+    } catch { /* next */ }
+  }
+  return null
+}
+
+async function backrun(ctx: Ctx, victim: any, freedWad: bigint) {
+  const started = Date.now()
+  const cfg = ctx.config
+  const keeper = ctx.keeper!
+  const victimRaw = await rawTransaction(victim.hash)
+  if (!victimRaw) return { skipped: 'raw transaction not available' }
+  const [n, head, availableNow] = await Promise.all([
+    client.getTransactionCount({ address: keeper.address, blockTag: 'latest' }),
+    client.getBlock(),
+    availableUsds(client as any),
+  ])
+  const exit = await exitLeg(ctx, [victimRaw], n)
+  const available = availableNow + freedWad - (isLeg(exit) ? exit.expected : 0n)
+  const arb = await arbLeg(ctx, isLeg(exit) ? [victimRaw, exit.raw] : [victimRaw], available, isLeg(exit) ? n + 1 : n, Number(cfg.arb_tip_share_race ?? 0.7))
+  if (!isLeg(exit) && !isLeg(arb)) {
+    await log(ctx, Number(head.number), 'backrun_nothing', { victim: victim.hash, freed_usds: formatUnits(freedWad, 18), exit, arb, ms: Date.now() - started })
+    return { skipped: 'nothing for us' }
+  }
+  const bundles: Hex[][] = []
+  if (isLeg(exit) && isLeg(arb)) bundles.push([victimRaw, exit.raw, arb.raw])
+  if (isLeg(exit)) bundles.push([victimRaw, exit.raw])
+  else if (isLeg(arb)) bundles.push([victimRaw, arb.raw])
+  const targets = [head.number + 1n, head.number + 2n]
+  const sent = await sendBundles(keeper, bundles, targets)
+  await log(ctx, Number(head.number), 'backrun_fired', {
+    victim: victim.hash, from: victim.from, to: victim.to, freed_usds: formatUnits(freedWad, 18), targets: targets.map(Number),
+    exit: isLeg(exit) ? exit.detail : exit, arb: isLeg(arb) ? arb.detail : arb, ms: Date.now() - started, builders: summarizeSends(sent),
+  })
+  await watchLanding(ctx, Number(head.number), 'backrun', isLeg(exit) ? exit : null, isLeg(arb) ? arb : null)
+  return { fired: true }
+}
+
+/** Watch pending transactions for ~110 s (pg_cron starts one run a minute; runs overlap). */
+async function mempoolWatch(ctx: Ctx) {
+  const cfg = ctx.config
+  if (!cfg.mempool_enabled || !cfg.enabled || !ctx.keeper) return
+  const safes = watchedSafes(cfg)
+  const seen = new Set<string>()
+  const deadline = Date.now() + 110_000
+  let closed = false
+  let busy = Promise.resolve()
+  const handle = (tx: any) => {
+    if (!tx?.hash || seen.has(tx.hash)) return
+    seen.add(tx.hash)
+    if (String(tx.from ?? '').toLowerCase() === ctx.keeper!.address.toLowerCase()) return
+    let freed = 0n
+    try {
+      freed = freedBy(tx, safes)
+    } catch { /* ignore */ }
+    if (freed <= 0n) return
+    // One backrun at a time per run: they share the bot key's nonce.
+    busy = busy.then(async () => backrun(ctx, tx, await freedByExact(tx, safes, client as any).catch(() => freed)).then((r) => console.log('backrun', tx.hash, JSON.stringify(r).slice(0, 200))).catch((e) => console.error('backrun failed', String(e))))
+  }
+  const sockets = new Set<WebSocket>()
+  const connect = (url: string) => {
+    if (closed || Date.now() > deadline - 3000) return
+    const ws = new WebSocket(url)
+    sockets.add(ws)
+    ws.onopen = () => ws.send(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_subscribe', params: ['newPendingTransactions', true] }))
+    ws.onmessage = (m) => {
+      try {
+        const r = JSON.parse(String(m.data))?.params?.result
+        if (r && typeof r === 'object') handle(r)
+      } catch { /* ignore malformed frames */ }
+    }
+    ws.onerror = () => {
+      try { ws.close() } catch { /* closed */ }
+    }
+    ws.onclose = () => {
+      sockets.delete(ws)
+      if (!closed) setTimeout(() => connect(url), 1500)
+    }
+  }
+  PENDING_WS.forEach(connect)
+  while (Date.now() < deadline) await sleep(1000)
+  closed = true
+  for (const ws of sockets) {
+    try { ws.close() } catch { /* closed */ }
+  }
+  await busy
+  console.log(`mempool run done: ${seen.size} pending transactions seen`)
 }
 
 // ---------- setup routes ----------
@@ -686,6 +892,19 @@ async function status(ctx: Ctx) {
       allowance_shares: allowance > 10n ** 40n ? 'unlimited' : formatUnits(allowance, 18), redeemable_shares: formatUnits(redeemable as bigint, 18),
     }
   }
+  if (ctx.config.arb_address) {
+    out.arb = {
+      address: ctx.config.arb_address,
+      enabled: !!ctx.config.arb_enabled,
+      code: await verifyArb(client as any, getAddress(ctx.config.arb_address), getAddress(MAIN_WALLET), ctx.keeper!.address)
+        .then(() => 'verified: tested build, profit to main wallet, bot key as keeper').catch((e) => `REJECTED: ${String(e)}`),
+      tip_share_safe: ctx.config.arb_tip_share_safe,
+      tip_share_race: ctx.config.arb_tip_share_race,
+      min_net_usd: ctx.config.arb_min_net_usd,
+    }
+  }
+  out.mempool_watch = !!ctx.config.mempool_enabled
+  out.available_usds = formatUnits(await availableUsds(client as any), 18)
   return out
 }
 
@@ -716,6 +935,15 @@ async function deploy(ctx: Ctx, body: any) {
   const receipt = await sendPublic(ctx.keeper!, { data, gas: 900_000n })
   await log(ctx, receipt.blockNumber, 'deployed', { target: body.target, owner, address: receipt.contractAddress, tx: receipt.transactionHash })
   return { address: receipt.contractAddress, owner, tx: receipt.transactionHash, gas_used: receipt.gasUsed }
+}
+
+/** Deploy the arb contract (profit fixed to the main wallet, bot key as keeper). */
+async function deployArb(ctx: Ctx) {
+  const receipt = await sendPublic(ctx.keeper!, { data: arbDeployData(getAddress(MAIN_WALLET), ctx.keeper!.address), gas: 2_500_000n })
+  const address = receipt.contractAddress!
+  await verifyArb(client as any, address, getAddress(MAIN_WALLET), ctx.keeper!.address)
+  await log(ctx, receipt.blockNumber, 'deployed_arb', { address, tx: receipt.transactionHash })
+  return { address, tx: receipt.transactionHash, gas_used: receipt.gasUsed }
 }
 
 /** Test wallet only: give it gas money and approve its exit contract. */
@@ -810,6 +1038,11 @@ Deno.serve(async (req) => {
       case 'tick':
         background(tick(ctx))
         return json({ started: true })
+      case 'mempool':
+        background(mempoolWatch(ctx))
+        return json({ started: true })
+      case 'deploy_arb':
+        return json(await deployArb(ctx))
       case 'setup':
         return json(await setup(ctx))
       case 'status':
