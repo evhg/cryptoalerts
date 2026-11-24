@@ -581,20 +581,29 @@ async function safeRoute(ctx: Ctx, safe: Hex, t: any, onchainNonce: bigint, thre
   return detail
 }
 
-async function pollSafe(ctx: Ctx) {
-  const safe = getAddress(ctx.config.watch_safe)
-  const base = `https://safe-transaction-mainnet.safe.global/api/v1/safes/${safe}`
-  const get = async (u: string) => {
-    const r = await fetch(u, { signal: AbortSignal.timeout(8000) })
-    if (!r.ok) throw new Error(`safe api ${r.status}`)
-    return r.json()
-  }
-  const [info, txs, onchainNonce, threshold] = await Promise.all([
-    get(`${base}/`),
-    get(`${base}/multisig-transactions/?limit=12`),
+/**
+ * The Safe's recent transactions from Safe's transaction service. Edge
+ * functions share outbound addresses that Safe rate-limits (HTTP 429), so
+ * fetch through Postgres first and only fall back to fetching directly.
+ */
+async function safeTxList(ctx: Ctx, safe: Hex) {
+  const viaDb = await db('stusds_exit_safe_fetch', { p_secret: ctx.secret, p_safe: safe, p_limit: 12 }).catch((e) => ({ error: String(e) }))
+  if (viaDb?.status === 200 && viaDb.body) return viaDb.body
+  const r = await fetch(`https://api.safe.global/tx-service/eth/api/v1/safes/${safe}/multisig-transactions/?limit=12`, { signal: AbortSignal.timeout(8000) })
+  if (!r.ok) throw new Error(`safe api: via db ${viaDb?.status ?? viaDb?.error ?? '?'}, direct ${r.status}`)
+  return r.json()
+}
+
+const watchedSafes = (cfg: any): Hex[] =>
+  String(cfg.watch_safe ?? '').split(',').map((s) => s.trim()).filter(Boolean).map((s) => getAddress(s))
+
+async function pollSafe(ctx: Ctx, safe: Hex) {
+  const [txs, onchainNonce, threshold] = await Promise.all([
+    safeTxList(ctx, safe),
     client.readContract({ address: safe, abi: safeAbi, functionName: 'nonce' }),
     client.readContract({ address: safe, abi: safeAbi, functionName: 'getThreshold' }),
   ])
+  const info = { nonce: onchainNonce, threshold }
   // The chain decides what is still pending, not the API's executed flag.
   for (const t of txs.results ?? []) {
     if (BigInt(t.nonce) !== onchainNonce || describeSafeTx(t).repay <= 0) continue
@@ -626,15 +635,24 @@ async function pollSafe(ctx: Ctx) {
 }
 
 async function tick(ctx: Ctx) {
-  if (!ctx.config.watch_safe) return
+  const safes = watchedSafes(ctx.config)
+  if (!safes.length) return
+  const failures: Record<string, string> = {}
+  let polls = 0
   for (let i = 0; i < 3; i++) {
-    try {
-      await pollSafe(ctx)
-    } catch (e) {
-      console.error('safe poll failed', String(e))
+    for (const safe of safes) {
+      polls++
+      try {
+        await pollSafe(ctx, safe)
+      } catch (e) {
+        failures[safe] = String(e).slice(0, 200)
+        console.error('safe poll failed', safe, String(e))
+      }
     }
     if (i < 2) await sleep(20_000)
   }
+  // A blind Safe watch must be visible: record any minute in which polling failed.
+  if (Object.keys(failures).length) await log(ctx, null, 'safe_poll_failed', { polls, failures })
 }
 
 // ---------- setup routes ----------
