@@ -62,6 +62,16 @@ const exitAbi = parseAbi([
   'function tipWeiPerUsds() view returns (uint256)',
   'function maxTipWei() view returns (uint256)',
 ])
+const safeAbi = parseAbi([
+  'function nonce() view returns (uint256)',
+  'function getThreshold() view returns (uint256)',
+  'function getTransactionHash(address to, uint256 value, bytes data, uint8 operation, uint256 safeTxGas, uint256 baseGas, uint256 gasPrice, address gasToken, address refundReceiver, uint256 _nonce) view returns (bytes32)',
+  'function execTransaction(address to, uint256 value, bytes data, uint8 operation, uint256 safeTxGas, uint256 baseGas, uint256 gasPrice, address gasToken, address refundReceiver, bytes signatures) payable returns (bool)',
+])
+const ETH_USD_FEED = '0x5f4eC3Df9cbd43714FE2740f5E3616155c5b8419' // Chainlink ETH / USD
+// Gas an exit actually uses (measured 232k-255k); used for fee budgeting only.
+const EXIT_GAS_USED = 260_000n
+
 const tokenAbi = parseAbi([
   'function balanceOf(address) view returns (uint256)',
   'function allowance(address, address) view returns (uint256)',
@@ -305,14 +315,50 @@ async function buildExit(ctx: Ctx) {
     client.readContract({ address: helper, abi: exitAbi, functionName: 'redeemable' }),
     client.getBalance({ address: keeper.address }),
   ])
-  // Keep back exactly what this transaction may be charged for gas (signTx's max fee).
-  const head = await client.getBlock()
-  const reserve = gas * ((head.baseFeePerGas ?? 0n) * 2n + parseGwei(String(cfg.priority_gwei ?? 2)))
-  let tip = parseGwei(String(cfg.tip_gwei ?? 0))
-  if (balance < reserve) tip = 0n
-  else if (tip > balance - reserve) tip = balance - reserve
   const data = encodeFunctionData({ abi: exitAbi, functionName: 'exit', args: [maxUint256, minAssets] })
-  return { keeper, helper, minAssets, gas, shares, balance, tip, data }
+  return { keeper, helper, minAssets, gas, shares, balance, data }
+}
+
+async function ethUsd(chainNow: bigint): Promise<number> {
+  const r = await client.readContract({
+    address: ETH_USD_FEED,
+    abi: parseAbi(['function latestRoundData() view returns (uint80, int256, uint256, uint256, uint80)']),
+    functionName: 'latestRoundData',
+  })
+  if (Number(chainNow) - Number(r[3]) > 6 * 3600) throw new Error('ETH price feed is stale')
+  return Number(r[1]) / 1e8
+}
+
+/**
+ * Fee policy: everything one exit costs (network gas for the gas we use, at
+ * base fee plus our priority fee, plus the builder tip) stays within fee_bps
+ * of the USDS it withdraws (default 10 = 0.1%). fee_floor_usd lets very small
+ * exits go through when gas is cheap. Returns the tip that fits in what is left.
+ */
+async function feePlan(cfg: any, expectedWad: bigint, gasUnits: bigint, keeperBalance: bigint, gasLimit: bigint) {
+  const head = await client.getBlock()
+  const price = await ethUsd(head.timestamp)
+  const base = head.baseFeePerGas ?? 0n
+  const prio = parseGwei(String(cfg.priority_gwei ?? 1))
+  const valueUsd = Number(formatUnits(expectedWad, 18))
+  const budgetUsd = Math.max((valueUsd * Number(cfg.fee_bps ?? 10)) / 10_000, Number(cfg.fee_floor_usd ?? 0))
+  const gasUsd = Number(formatEther(gasUnits * (base + prio))) * price
+  const plan = { price, valueUsd, budgetUsd, gasUsd, tipWei: 0n, ok: gasUsd <= budgetUsd, reason: '' }
+  if (!plan.ok) {
+    plan.reason = `gas $${gasUsd.toFixed(2)} exceeds the fee budget $${budgetUsd.toFixed(2)}`
+    return plan
+  }
+  let tip = parseEther(((budgetUsd - gasUsd) / price).toFixed(18))
+  // The keeper must still be able to pay the worst-case gas of the transactions it signs.
+  const reserve = gasLimit * (base * 2n + prio)
+  if (keeperBalance <= reserve) {
+    plan.ok = false
+    plan.reason = 'bot key cannot cover gas'
+    return plan
+  }
+  if (tip > keeperBalance - reserve) tip = keeperBalance - reserve
+  plan.tipWei = tip
+  return plan
 }
 
 /** The main path: liquidity is there, send the exit privately for the next blocks. */
@@ -333,7 +379,7 @@ async function fire(ctx: Ctx, seenBlock: number) {
       functionName: 'exit',
       args: [maxUint256, x.minAssets],
       account: x.keeper.address,
-      value: x.tip,
+      value: 0n,
     })
     expected = sim.result
   } catch (e) {
@@ -341,10 +387,17 @@ async function fire(ctx: Ctx, seenBlock: number) {
     return { skipped: 'simulation reverted' }
   }
 
+  const plan = await feePlan(cfg, expected, EXIT_GAS_USED, x.balance, x.gas)
+  if (!plan.ok) {
+    await log(ctx, seenBlock, 'over_fee_budget', { expected_usds: formatUnits(expected, 18), ...plan, tipWei: undefined })
+    return { skipped: plan.reason }
+  }
+  const tip = plan.tipWei
+
   // Always the confirmed nonce: a still-pending public copy of an earlier attempt
   // must be replaced, not queued behind (builders drop bundles with a nonce gap).
   const confirmedNonce = await client.getTransactionCount({ address: x.keeper.address, blockTag: 'latest' })
-  const { raw, hash, head, nonce } = await signTx(x.keeper, { to: x.helper, data: x.data, value: x.tip, gas: x.gas }, Number(cfg.priority_gwei ?? 2), confirmedNonce)
+  const { raw, hash, head, nonce } = await signTx(x.keeper, { to: x.helper, data: x.data, value: tip, gas: x.gas }, Number(cfg.priority_gwei ?? 1), confirmedNonce)
   const targets = [head.number + 1n, head.number + 2n, head.number + 3n]
   const sent = LOCAL_SUBMIT
     ? [{ builder: 'local-fork', body: await client.sendRawTransaction({ serializedTransaction: raw }) }]
@@ -363,7 +416,9 @@ async function fire(ctx: Ctx, seenBlock: number) {
     head_age_ms: Date.now() - Number(head.timestamp) * 1000,
     targets: targets.map(Number),
     expected_usds: formatUnits(expected, 18),
-    tip_eth: formatEther(x.tip),
+    tip_eth: formatEther(tip),
+    fee_budget_usd: plan.budgetUsd,
+    gas_usd: plan.gasUsd,
     ms: sentMs,
     builders: sent,
   })
@@ -415,6 +470,117 @@ function describeSafeTx(t: any): { repay: number; summary: string } {
   return { repay, summary: parts.join(' + ').slice(0, 200) }
 }
 
+/**
+ * Safe route. A repayment that sits fully signed in a Safe's queue can be
+ * submitted by anyone: the owners' signatures are the authorisation and the
+ * submitter only pays gas. We submit it ourselves with the exit right behind
+ * it, as one bundle, so the freed USDS reaches the exit before anyone else.
+ * We execute exactly what the owners signed (checked against the Safe's own
+ * transaction hash) and nothing else.
+ */
+const safeRouteSent = new Map<string, number>() // safeTxHash -> last block targeted
+
+async function safeRoute(ctx: Ctx, safe: Hex, t: any, onchainNonce: bigint, threshold: bigint) {
+  const cfg = ctx.config
+  if (!cfg.enabled || !cfg.safe_route || !ctx.keeper || !cfg.helper_address) return { skipped: 'not armed' }
+  if (BigInt(t.nonce) !== onchainNonce) return { skipped: 'not next in the Safe queue' }
+  const confs = [...(t.confirmations ?? [])].filter((c: any) => typeof c.signature === 'string' && c.signature.length === 132)
+  if (BigInt(confs.length) < threshold) return { skipped: 'not fully signed' }
+  if (BigInt(t.gasPrice ?? 0) !== 0n) return { skipped: 'Safe transaction pays a gas refund; not touching it' }
+  // Safe checks signatures in ascending owner order and uses the first `threshold`.
+  confs.sort((a: any, b: any) => (BigInt(a.owner) < BigInt(b.owner) ? -1 : 1))
+  const signatures = ('0x' + confs.slice(0, Number(threshold)).map((c: any) => c.signature.slice(2)).join('')) as Hex
+  const args = [
+    getAddress(t.to), BigInt(t.value ?? 0), (t.data ?? '0x') as Hex, Number(t.operation ?? 0), BigInt(t.safeTxGas ?? 0),
+    BigInt(t.baseGas ?? 0), 0n, getAddress(t.gasToken ?? '0x0000000000000000000000000000000000000000'),
+    getAddress(t.refundReceiver ?? '0x0000000000000000000000000000000000000000'),
+  ] as const
+  const hash = await client.readContract({ address: safe, abi: safeAbi, functionName: 'getTransactionHash', args: [...args, onchainNonce] })
+  if (hash.toLowerCase() !== String(t.safeTxHash).toLowerCase()) return { skipped: 'transaction does not match what the owners signed' }
+
+  const head = await client.getBlock()
+  if ((safeRouteSent.get(t.safeTxHash) ?? 0) > Number(head.number)) return { skipped: 'already covering the next blocks' }
+  const keeper = ctx.keeper
+  const execData = encodeFunctionData({ abi: safeAbi, functionName: 'execTransaction', args: [...args, signatures] })
+  let execGas: bigint
+  try {
+    const ok = await client.simulateContract({ address: safe, abi: safeAbi, functionName: 'execTransaction', args: [...args, signatures], account: keeper.address })
+    if (!ok.result) return { skipped: 'Safe transaction would fail' }
+    execGas = (await client.estimateGas({ account: keeper.address, to: safe, data: execData })) * 13n / 10n
+  } catch (e) {
+    await log(ctx, Number(head.number), 'safe_route_sim_failed', { safeTxHash: t.safeTxHash, error: String(e).slice(0, 300) })
+    return { skipped: 'Safe transaction simulation failed' }
+  }
+
+  const x = await buildExit(ctx)
+  const n = await client.getTransactionCount({ address: keeper.address, blockTag: 'latest' })
+  const prio = Number(cfg.priority_gwei ?? 1)
+  const exec = await signTx(keeper, { to: safe, data: execData, gas: execGas }, prio, n)
+
+  // How much would the exit get right after the repayment? Simulate the pair.
+  let expected: bigint
+  if (LOCAL_SUBMIT) {
+    // Local fork rehearsal only: no bundle simulator, so assume the whole approved position comes out.
+    const { owner } = await verifyHelper(ctx)
+    const [bal, allowed] = await Promise.all([
+      client.readContract({ address: ST_USDS, abi: tokenAbi, functionName: 'balanceOf', args: [owner] }),
+      client.readContract({ address: ST_USDS, abi: tokenAbi, functionName: 'allowance', args: [owner, x.helper] }),
+    ])
+    expected = await client.readContract({ address: ST_USDS, abi: tokenAbi, functionName: 'convertToAssets', args: [bal < allowed ? bal : allowed] })
+  } else {
+    const probe = await signTx(keeper, { to: x.helper, data: x.data, value: 0n, gas: x.gas }, prio, n + 1)
+    const fb = BUILDERS.find((b) => b.name === 'flashbots')!
+    const sim = await builderCall(fb, keeper, 'eth_callBundle', [{ txs: [exec.raw, probe.raw], blockNumber: toHex(head.number + 1n), stateBlockNumber: 'latest' }])
+    let parsed: any = null
+    try { parsed = JSON.parse(sim.body ?? '') } catch { /* below */ }
+    const results = parsed?.result?.results
+    if (!Array.isArray(results) || results.length !== 2 || results[0].error || results[1].error) {
+      await log(ctx, Number(head.number), 'safe_route_bundle_sim_failed', { safeTxHash: t.safeTxHash, sim })
+      return { skipped: 'bundle simulation failed' }
+    }
+    expected = BigInt(results[1].value)
+  }
+
+  const plan = await feePlan(cfg, expected, execGas + EXIT_GAS_USED, x.balance, execGas + x.gas)
+  if (!plan.ok) {
+    await log(ctx, Number(head.number), 'over_fee_budget', { route: 'safe', expected_usds: formatUnits(expected, 18), ...plan, tipWei: undefined })
+    return { skipped: plan.reason }
+  }
+  const exit = await signTx(keeper, { to: x.helper, data: x.data, value: plan.tipWei, gas: x.gas }, prio, n + 1)
+  const targets = [head.number + 1n, head.number + 2n, head.number + 3n]
+  const sent = LOCAL_SUBMIT
+    ? [
+      { builder: 'local-fork', body: await client.sendRawTransaction({ serializedTransaction: exec.raw }) },
+      { builder: 'local-fork', body: await client.sendRawTransaction({ serializedTransaction: exit.raw }) },
+    ]
+    // Never public: their signed transaction goes only to builders, inside our bundle.
+    : await Promise.all(
+      BUILDERS.flatMap((b) => targets.map((tb) => builderCall(b, keeper, 'eth_sendBundle', [{ txs: [exec.raw, exit.raw], blockNumber: toHex(tb) }]))),
+    )
+  safeRouteSent.set(t.safeTxHash, Number(head.number) + 2)
+  const detail = {
+    safeTxHash: t.safeTxHash, safe_nonce: Number(onchainNonce), exec_hash: exec.hash, exit_hash: exit.hash,
+    targets: targets.map(Number), expected_usds: formatUnits(expected, 18), tip_eth: formatEther(plan.tipWei),
+    fee_budget_usd: plan.budgetUsd, gas_usd: plan.gasUsd, builders: sent,
+  }
+  await log(ctx, Number(head.number), 'safe_route_fired', detail)
+  for (let i = 0; i < 16; i++) {
+    await sleep(2500)
+    const receipt = await client.getTransactionReceipt({ hash: exit.hash }).catch(() => null)
+    if (receipt) {
+      await log(ctx, receipt.blockNumber, 'safe_route_included', { exit_hash: exit.hash, block: Number(receipt.blockNumber), index: receipt.transactionIndex, status: receipt.status })
+      await notify(
+        ctx,
+        'stusds:exit',
+        receipt.status === 'success' ? 'stUSDS withdrawal landed (Safe route)' : 'stUSDS withdrawal reverted (Safe route)',
+        `${usd(expected)} USDS expected, right behind the Safe repayment in block ${receipt.blockNumber} (${cfg.target_name}). https://etherscan.io/tx/${exit.hash}`,
+      )
+      return detail
+    }
+  }
+  return detail
+}
+
 async function pollSafe(ctx: Ctx) {
   const safe = getAddress(ctx.config.watch_safe)
   const base = `https://safe-transaction-mainnet.safe.global/api/v1/safes/${safe}`
@@ -423,7 +589,18 @@ async function pollSafe(ctx: Ctx) {
     if (!r.ok) throw new Error(`safe api ${r.status}`)
     return r.json()
   }
-  const [info, txs] = await Promise.all([get(`${base}/`), get(`${base}/multisig-transactions/?limit=12`)])
+  const [info, txs, onchainNonce, threshold] = await Promise.all([
+    get(`${base}/`),
+    get(`${base}/multisig-transactions/?limit=12`),
+    client.readContract({ address: safe, abi: safeAbi, functionName: 'nonce' }),
+    client.readContract({ address: safe, abi: safeAbi, functionName: 'getThreshold' }),
+  ])
+  // The chain decides what is still pending, not the API's executed flag.
+  for (const t of txs.results ?? []) {
+    if (BigInt(t.nonce) !== onchainNonce || describeSafeTx(t).repay <= 0) continue
+    const r = await safeRoute(ctx, safe, t, onchainNonce, threshold).catch((e) => ({ error: String(e).slice(0, 300) }))
+    console.log('safe route', t.safeTxHash.slice(0, 10), JSON.stringify(r).slice(0, 300))
+  }
   const rows = (txs.results ?? [])
     // A pending transaction below the Safe's current nonce has been replaced and can never run.
     .filter((t: any) => t.isExecuted || Number(t.nonce) >= Number(info.nonce))
@@ -579,10 +756,11 @@ async function sweep(ctx: Ctx, body: any) {
 /** Plumbing check: sign the real exit transaction and ask Flashbots to simulate it. */
 async function simulate(ctx: Ctx) {
   const x = await buildExit(ctx)
-  const { raw, hash, head } = await signTx(x.keeper, { to: x.helper, data: x.data, value: x.tip, gas: x.gas }, Number(ctx.config.priority_gwei ?? 2))
+  const { raw, hash, head } = await signTx(x.keeper, { to: x.helper, data: x.data, value: 0n, gas: x.gas }, Number(ctx.config.priority_gwei ?? 1))
   const fb = BUILDERS.find((b) => b.name === 'flashbots')!
   const sim = await builderCall(fb, x.keeper, 'eth_callBundle', [{ txs: [raw], blockNumber: toHex(head.number + 1n), stateBlockNumber: 'latest' }])
-  return { hash, redeemable_shares: formatUnits(x.shares, 18), tip_eth: formatEther(x.tip), keeper_eth: formatEther(x.balance), flashbots_simulation: sim }
+  const plan = await feePlan(ctx.config, parseUnits('100000', 18), EXIT_GAS_USED, x.balance, x.gas)
+  return { hash, redeemable_shares: formatUnits(x.shares, 18), keeper_eth: formatEther(x.balance), fee_plan_for_100k_usds: { ...plan, tipWei: formatEther(plan.tipWei) }, flashbots_simulation: sim }
 }
 
 // ---------- HTTP entry ----------
