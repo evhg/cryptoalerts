@@ -54,6 +54,8 @@ const EMAIL_TO = process.env.STUSDS_ALERT_TO ?? ''
 const EMAIL_FROM = process.env.STUSDS_ALERT_FROM ?? ''
 const TEST = process.env.STUSDS_TEST === '1'
 const NOTICE_EVERY_MS = 6 * 3600_000
+// Every time shown to the user is Bangkok time (their standing preference; never UTC).
+const bkk = (ms: number) => new Date(ms).toLocaleString('sv-SE', { timeZone: 'Asia/Bangkok' }) + ' Bangkok time'
 
 type State = {
   armed: boolean
@@ -108,7 +110,7 @@ if (process.argv.includes('--status')) {
       lastBlock: s.lastBlock,
       lastEvalAgeSeconds: ageS,
       utilization: s.lastUtilPpm === null ? null : fmtPct(s.lastUtilPpm, 4),
-      lastAlertAt: s.lastAlertAt ? new Date(s.lastAlertAt).toISOString() : null,
+      lastAlertAt: s.lastAlertAt ? bkk(s.lastAlertAt) : null,
     }
     if (out.running && ageS !== null && ageS < 30) break
     await sleep(500)
@@ -147,7 +149,7 @@ const describe = (s: Snapshot) => ({
   withdrawableUsds: fmtUsds(s.availableWad),
   totalAssetsUsds: fmtUsds(s.totalAssets),
   block: s.block,
-  blockTime: new Date(s.timestamp * 1000).toISOString(),
+  blockTime: bkk(s.timestamp * 1000),
   detectedSecondsAfterBlock: Number(((Date.now() - s.timestamp * 1000) / 1000).toFixed(1)),
 })
 

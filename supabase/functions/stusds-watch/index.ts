@@ -117,7 +117,8 @@ const esc = (s: string) => s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&l
 function alertEmail(s: Snapshot, thresholdPpm: number, opts: { test?: boolean; note?: string } = {}): Mail {
   const pct = fmtPct(s.utilPpm)
   const avail = fmtUsds(s.availableWad)
-  const blockTime = new Date(s.timestamp * 1000).toISOString().replace('.000Z', 'Z')
+  // Bangkok time, per the user's standing preference (never UTC).
+  const blockTime = new Date(s.timestamp * 1000).toLocaleString('sv-SE', { timeZone: 'Asia/Bangkok' }) + ' Bangkok time'
   const delay = ((Date.now() - s.timestamp * 1000) / 1000).toFixed(1)
   const prefix = opts.test ? '[TEST] ' : ''
   const subject = `${prefix}stUSDS utilization ${pct} - ${avail} USDS withdrawable`
@@ -166,7 +167,9 @@ async function runLoop(cfg: Config) {
   const thresholdPpm = BigInt(cfg.threshold_ppm)
 
   if (cfg.notify_stale) {
-    const since = cfg.last_eval_at ?? 'unknown'
+    const since = cfg.last_eval_at
+      ? new Date(cfg.last_eval_at).toLocaleString('sv-SE', { timeZone: 'Asia/Bangkok' }) + ' Bangkok time'
+      : 'unknown'
     const body =
       `The stUSDS utilization watcher had not evaluated a block since ${since} (last block ${cfg.last_block}).\n` +
       'It is running again now. If this message repeats, the watcher cannot reach its Ethereum RPC endpoints.'
