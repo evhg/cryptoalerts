@@ -116,16 +116,21 @@ Contracts (`contracts/src`, fork tests in `contracts/test`):
 - `StUsdsExit` — redeems the owner's stUSDS to the owner, only what Sky can pay, tip to the builder capped and paid from the caller's ETH. Main wallet: `0xbF54F2AA78b4c240e34224073aff9E89Cd915897`; test wallet: `0x01662b082432859c366ab16362eab10fb72c73e6`. The owner arms it with one `approve` on stUSDS (see `contracts/review/` for the second-opinion packet and an independent bytecode check).
 - `StUsdsArb` — flash-mints DAI, buys stUSDS below its redemption value through the KyberSwap router, redeems it at Sky, repays, tips the builder out of profit (checked against Chainlink) and sends the rest to the main wallet. Holds nothing between transactions and has no approval on anyone's funds. Deployed at `0xa2749a6d8de66523c9132d964b5c61d363a5fbe3`.
 
+- `StUsdsArb2` — the same arb with direct routing: the purchase and the tip conversion are lists of calls to a venue list fixed at deployment (the Curve stUSDS/USDS pool, Sky's USDS/USDC converter, Uniswap's router, the KyberSwap router). It buys through the Curve pool's add-liquidity / remove-one-coin path, which is cheaper than a swap while the pool is this lopsided, and needs no outside API. Same guarantees as `StUsdsArb`: flash-minted money only, profit only to the main wallet, no approvals on anyone's funds.
+- `StUsdsQuoter` — tells exactly how many stUSDS an amount of USDS buys on that path by doing the purchase with flash-minted DAI and reverting it. Called off-chain only; it has no owner and can move nothing.
+
 Three routes. Each one first simulates the withdrawal followed by a read-only "lens" call at the builder (Flashbots `eth_callBundle`), which tells exactly how much USDS is withdrawable behind the triggering transaction whatever shape that transaction has. It then sends the exit bundle at once and, a moment later, a second bundle with the arb on what is left:
 - end of block (`fire`, from the block observer);
 - Safe route (`tick`): a fully signed repayment in a watched borrower Safe is executed by the bot with its transactions right behind it. Needs the `SAFE_API_KEY` function secret (free key from developer.safe.global); without it Safe's public API allows about 5,000 requests a month and the route is blind;
 - backrun (`mempool`, pending-transaction feed): any pending transaction that touches the lending engine's repay functions or deposits into stUSDS, directly or through a Safe, a multicall, an ERC-4337 bundle or an EIP-7702 batch.
 
+The arb goes out in up to two bundles: the direct one (`arb2.ts`, sized with exact quotes from `StUsdsQuoter`, ready about a second after the liquidity is measured) and, from `arb_kyber_min_usds` of freed liquidity on, the KyberSwap one (`arb.ts`), which is slower but also reaches resting limit orders. Both use the same nonce, so at most one can land.
+
 Overlapping runs are de-duplicated through `stusds_exit_claim`. The arb sizes itself from the price ladder the collector keeps fresh, so only a handful of KyberSwap calls happen at fire time. `simcheck` runs the lens live; `status` reports wallets, code checks and whether the Safe API key is present.
 
-Settings (`stusds_alert.exit_config`): `enabled`, `target_name`/`helper_address`, `fee_bps` (exit fee cap, default 10 = 0.1%), `fee_floor_usd`, `safe_route`, `watch_safe` (comma-separated), `safe_poll_seconds` (10), `arb_enabled`, `arb_address`, `arb_tip_share_safe` (0.3), `arb_tip_share_race` (0.85), `arb_min_net_usd` (25), `mempool_enabled`.
+Settings (`stusds_alert.exit_config`): `enabled`, `target_name`/`helper_address`, `fee_bps` (exit fee cap, default 10 = 0.1%), `fee_floor_usd`, `safe_route`, `watch_safe` (comma-separated), `safe_poll_seconds` (10), `arb_enabled`, `arb_address`, `arb_tip_share_safe` (0.3), `arb_tip_share_race` (0.99: winners of open races give the builder about 99% of the profit), `arb_min_net_usd` (2), `arb2_address`, `arb_quoter_address`, `arb_kyber_min_usds` (150000), `mempool_enabled`.
 
-Tests: `cd contracts && forge test` (42 fork tests; `node test/fixtures/build-arb-fixture.mjs` refreshes the Kyber calldata fixture), `deno run --allow-net supabase/functions/stusds-exit/pending_test.ts` (pending-transaction decoder against real transactions).
+Tests: `cd contracts && forge test` (67 fork tests; `node test/fixtures/build-arb-fixture.mjs` refreshes the Kyber calldata fixture), `deno run --allow-net supabase/functions/stusds-exit/pending_test.ts` (pending-transaction decoder against real transactions).
 
 ## Dashboard and collector (`supabase/functions/stusds-dash`, `dashboard/`)
 

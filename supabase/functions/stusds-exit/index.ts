@@ -45,6 +45,7 @@ import { generatePrivateKey, type PrivateKeyAccount, privateKeyToAccount } from 
 import { mainnet } from 'npm:viem@2.58.4/chains'
 import { EXIT_CREATION_BYTECODE } from './bytecode.ts'
 import { ARB_GAS_LIMIT, arbDeployData, availableUsds, type Ladder, ladderQuotes, planArb, verifyArb } from './arb.ts'
+import { arb2DeployData, planDirect, quoterDeployData, verifyArb2, verifyQuoter } from './arb2.ts'
 import { amountHint, isCandidate, rebuildRaw } from './pending.ts'
 
 declare const EdgeRuntime: { waitUntil(p: Promise<unknown>): void } | undefined
@@ -643,12 +644,43 @@ async function arbLeg(ctx: Ctx, preceding: Hex[], availableWad: bigint, nonce: n
   }
 }
 
+/**
+ * The same arb through the direct-routing contract: priced from the Curve pool
+ * itself, so it is ready about a second after the liquidity is measured.
+ */
+async function directArbLeg(ctx: Ctx, preceding: Hex[], availableWad: bigint, nonce: number, tipShare: number): Promise<Leg | Skip> {
+  const cfg = ctx.config
+  if (!cfg.arb_enabled || !cfg.arb2_address || !ctx.keeper) return { skipped: 'direct arb off' }
+  if (availableWad < parseUnits('1000', 18)) return { skipped: 'too little liquidity for an arb', available_usds: formatUnits(availableWad > 0n ? availableWad : 0n, 18) }
+  try {
+    const arb = await verifyArb2(client as any, getAddress(cfg.arb2_address), getAddress(MAIN_WALLET), ctx.keeper.address)
+    const prio = Number(cfg.priority_gwei ?? 1)
+    const quoter = cfg.arb_quoter_address ? await verifyQuoter(client as any, getAddress(cfg.arb_quoter_address)).catch(() => undefined) : undefined
+    const r: any = await planDirect({
+      client: client as any,
+      arb,
+      quoter,
+      availableWad,
+      preceding,
+      sign: (to, data, gas) => signTx(ctx.keeper!, { to, data, gas }, prio, nonce),
+      simulate: (raws) => simulateBundle(ctx, raws),
+      tipShare,
+      minNetUsds: Number(cfg.arb_min_net_usd ?? 25),
+    })
+    if (!r.raw) return { skipped: r.skipped ?? 'no plan', ...r }
+    const { raw, hash, ...rest } = r
+    return { raw, hash, expected: 0n, detail: { hash, nonce, tip_share: tipShare, ...rest } }
+  } catch (e) {
+    return { skipped: String(e).slice(0, 200) }
+  }
+}
+
 /** Wait for whichever of our transactions lands, log it and tell the user. */
-async function watchLanding(ctx: Ctx, seenBlock: number, route: string, exit: Leg | null, arb: Leg | null) {
+async function watchLanding(ctx: Ctx, seenBlock: number, route: string, exit: Leg | null, arbs: Leg[]) {
   const cfg = ctx.config
   const pending = new Map<Hex, 'exit' | 'arb'>()
   if (exit) pending.set(exit.hash, 'exit')
-  if (arb) pending.set(arb.hash, 'arb')
+  for (const a of arbs) pending.set(a.hash, 'arb')
   for (let i = 0; i < 20 && pending.size; i++) {
     await sleep(2500)
     for (const [hash, kind] of [...pending]) {
@@ -665,7 +697,8 @@ async function watchLanding(ctx: Ctx, seenBlock: number, route: string, exit: Le
           `${usd(exit!.expected)} USDS expected, block ${receipt.blockNumber} position ${receipt.transactionIndex} (${cfg.target_name}). https://etherscan.io/tx/${hash}`,
         )
       } else if (receipt.status === 'success') {
-        await notify(ctx, 'stusds:arb', `stUSDS arb landed (${route})`, `About ${Number(arb!.detail.net ?? 0).toLocaleString('en-US', { maximumFractionDigits: 0 })} USDS profit sent to the main wallet, block ${receipt.blockNumber}. https://etherscan.io/tx/${hash}`)
+        const won = arbs.find((a) => a.hash === hash)
+        await notify(ctx, 'stusds:arb', `stUSDS arb landed (${route})`, `About ${Number(won?.detail.net ?? 0).toLocaleString('en-US', { maximumFractionDigits: 0 })} USDS profit sent to the main wallet, block ${receipt.blockNumber}. https://etherscan.io/tx/${hash}`)
       }
     }
   }
@@ -682,11 +715,12 @@ async function runRoute(ctx: Ctx, o: { route: 'end of block' | 'Safe route' | 'b
   const t0 = Date.now()
   const cfg = ctx.config
   const keeper = ctx.keeper!
-  const arbOn = !!(cfg.arb_enabled && cfg.arb_address)
+  const arbOn = !!(cfg.arb_enabled && (cfg.arb_address || cfg.arb2_address))
+  const kyberOn = !!(cfg.arb_enabled && cfg.arb_address)
   const [head, p, ladder] = await Promise.all([
     getHead(),
     probeLiquidity(ctx, o.preceding, o.n),
-    arbOn ? (ctx.ladder ? Promise.resolve(ctx.ladder) : ladderQuotes(client as any).catch(() => null)) : Promise.resolve(null),
+    kyberOn ? (ctx.ladder ? Promise.resolve(ctx.ladder) : cfg.arb2_address ? Promise.resolve(null) : ladderQuotes(client as any).catch(() => null)) : Promise.resolve(null),
   ])
   const probeMs = Date.now() - t0
   if (!p.ok) {
@@ -702,8 +736,19 @@ async function runRoute(ctx: Ctx, o: { route: 'end of block' | 'Safe route' | 'b
   // An exit that was priced out by the fee policy leaves its liquidity for the arb.
   const available = p.availableAfter + (!isLeg(exit) && p.exitExpected !== null ? p.exitExpected : 0n)
   const before = isLeg(exit) ? [...o.preceding, exit.raw] : o.preceding
-  const arb = await arbLeg(ctx, before, available, isLeg(exit) ? o.n + 1 : o.n, o.tipShare, ladder)
-  if (isLeg(arb) && !LOCAL_SUBMIT) sent.push(...await sendBundles(keeper, [[...before, arb.raw]], targets))
+  const arbNonce = isLeg(exit) ? o.n + 1 : o.n
+  // Direct route first: it needs no outside quote and is out within about a second.
+  const direct = await directArbLeg(ctx, before, available, arbNonce, o.tipShare)
+  if (isLeg(direct) && !LOCAL_SUBMIT) sent.push(...await sendBundles(keeper, [[...before, direct.raw]], targets))
+  const directMs = Date.now() - t0
+  // The KyberSwap route also reaches resting limit orders, which matters for large openings. It is slower, so it
+  // goes out as a second bundle (same nonce: at most one of the two can land) or stands in when the direct one has no plan.
+  const wantKyber = kyberOn && (!isLeg(direct) || available >= parseUnits(String(cfg.arb_kyber_min_usds ?? 150000), 18))
+  const kyber: Leg | Skip = wantKyber ? await arbLeg(ctx, before, available, arbNonce, o.tipShare, ladder) : { skipped: 'not needed at this size' }
+  if (isLeg(kyber) && !LOCAL_SUBMIT) sent.push(...await sendBundles(keeper, [[...before, kyber.raw]], targets))
+  // The better-paying of the two is the one a builder would take.
+  const tipOf = (l: Leg | Skip) => (isLeg(l) ? Number(l.detail.tip_usds ?? 0) : -1)
+  const arb: Leg | Skip = tipOf(kyber) > tipOf(direct) ? kyber : isLeg(direct) ? direct : kyber
   if (LOCAL_SUBMIT && (isLeg(exit) || isLeg(arb))) sent.push(...await localCommit(isLeg(arb) ? [...before, arb.raw] : before))
 
   const detail = {
@@ -714,7 +759,9 @@ async function runRoute(ctx: Ctx, o: { route: 'end of block' | 'Safe route' | 'b
     available_after_exit_usds: formatUnits(p.availableAfter > 0n ? p.availableAfter : 0n, 18),
     exit: isLeg(exit) ? exit.detail : exit,
     arb: isLeg(arb) ? arb.detail : arb,
-    ms: { probe: probeMs, exit_sent: exitMs, total: Date.now() - t0 },
+    arb_direct: isLeg(direct) ? direct.detail : direct,
+    arb_kyber: isLeg(kyber) ? kyber.detail : kyber,
+    ms: { probe: probeMs, exit_sent: exitMs, direct_arb_sent: directMs, total: Date.now() - t0 },
     builders: summarizeSends(sent),
     ...o.meta,
   }
@@ -723,7 +770,7 @@ async function runRoute(ctx: Ctx, o: { route: 'end of block' | 'Safe route' | 'b
     return { skipped: 'nothing for us' }
   }
   await log(ctx, o.seenBlock, 'fired', detail)
-  await watchLanding(ctx, o.seenBlock, o.route, isLeg(exit) ? exit : null, isLeg(arb) ? arb : null)
+  await watchLanding(ctx, o.seenBlock, o.route, isLeg(exit) ? exit : null, LOCAL_SUBMIT ? (isLeg(arb) ? [arb] : []) : [direct, kyber].filter(isLeg))
   return { fired: true }
 }
 
@@ -1060,6 +1107,17 @@ async function status(ctx: Ctx) {
       min_net_usd: ctx.config.arb_min_net_usd,
     }
   }
+  if (ctx.config.arb2_address) {
+    out.arb_direct = {
+      address: ctx.config.arb2_address,
+      code: await verifyArb2(client as any, getAddress(ctx.config.arb2_address), getAddress(MAIN_WALLET), ctx.keeper!.address)
+        .then(() => 'verified: tested build, profit to main wallet, bot key as keeper, fixed venue list').catch((e) => `REJECTED: ${String(e)}`),
+      quoter: ctx.config.arb_quoter_address ?? null,
+      quoter_code: ctx.config.arb_quoter_address
+        ? await verifyQuoter(client as any, getAddress(ctx.config.arb_quoter_address)).then(() => 'verified: tested build').catch((e) => `REJECTED: ${String(e)}`)
+        : 'none',
+    }
+  }
   out.mempool_watch = !!ctx.config.mempool_enabled
   out.safe_api_key = !!env('SAFE_API_KEY')
   out.available_usds = formatUnits(await availableUsds(client as any), 18)
@@ -1102,6 +1160,18 @@ async function deployArb(ctx: Ctx) {
   await verifyArb(client as any, address, getAddress(MAIN_WALLET), ctx.keeper!.address)
   await log(ctx, receipt.blockNumber, 'deployed_arb', { address, tx: receipt.transactionHash })
   return { address, tx: receipt.transactionHash, gas_used: receipt.gasUsed }
+}
+
+/** Deploy the direct-routing arb contract (profit fixed to the main wallet, bot key as keeper, fixed venue list). */
+async function deployArb2(ctx: Ctx) {
+  const receipt = await sendPublic(ctx.keeper!, { data: arb2DeployData(getAddress(MAIN_WALLET), ctx.keeper!.address), gas: 2_500_000n })
+  const address = receipt.contractAddress!
+  await verifyArb2(client as any, address, getAddress(MAIN_WALLET), ctx.keeper!.address)
+  const q = await sendPublic(ctx.keeper!, { data: quoterDeployData(), gas: 900_000n })
+  const quoter = q.contractAddress!
+  await verifyQuoter(client as any, quoter)
+  await log(ctx, receipt.blockNumber, 'deployed_arb2', { address, tx: receipt.transactionHash, quoter, quoter_tx: q.transactionHash })
+  return { address, tx: receipt.transactionHash, gas_used: receipt.gasUsed, quoter, quoter_tx: q.transactionHash, quoter_gas_used: q.gasUsed }
 }
 
 /** Test wallet only: give it gas money and approve its exit contract. */
@@ -1209,6 +1279,8 @@ Deno.serve(async (req) => {
         return json({ started: true })
       case 'deploy_arb':
         return json(await deployArb(ctx))
+      case 'deploy_arb2':
+        return json(await deployArb2(ctx))
       case 'simcheck':
         return json(await simcheck(ctx))
       case 'backrun_test': {
