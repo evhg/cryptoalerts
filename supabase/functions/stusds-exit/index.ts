@@ -468,9 +468,9 @@ async function localCommit(bundle: Hex[]) {
 }
 
 /** Send each bundle to every builder for each target block. */
-async function sendBundles(signer: PrivateKeyAccount, bundles: Hex[][], targets: bigint[], publicRaw?: Hex) {
+async function sendBundles(signer: PrivateKeyAccount, bundles: Hex[][], targets: bigint[], publicRaw?: Hex, mayRevert?: Hex[]) {
   return await Promise.all([
-    ...BUILDERS.flatMap((b) => targets.flatMap((t) => bundles.map((txs) => builderCall(b, signer, 'eth_sendBundle', [{ txs, blockNumber: toHex(t) }])))),
+    ...BUILDERS.flatMap((b) => targets.flatMap((t) => bundles.map((txs) => builderCall(b, signer, 'eth_sendBundle', [{ txs, blockNumber: toHex(t), ...(mayRevert?.length ? { revertingTxHashes: mayRevert } : {}) }])))),
     ...(publicRaw ? PUBLIC_MEMPOOL.map((u) => publicSend(u, publicRaw)) : []),
   ])
 }
@@ -625,7 +625,7 @@ async function arbLeg(ctx: Ctx, preceding: Hex[], availableWad: bigint, nonce: n
   if (availableWad < parseUnits(String(Math.max(Number(cfg.arb_min_usds ?? 1000), 1000)), 18)) return { skipped: 'too little liquidity for an arb', available_usds: formatUnits(availableWad > 0n ? availableWad : 0n, 18) }
   try {
     const arb = await verifyArb(client as any, getAddress(cfg.arb_address), getAddress(MAIN_WALLET), ctx.keeper.address)
-    const prio = Number(cfg.priority_gwei ?? 1)
+    const prio = Number(cfg.arb_priority_gwei ?? 0.05)
     const r: any = await planArb({
       arb,
       availableWad,
@@ -655,7 +655,8 @@ async function directArbLeg(ctx: Ctx, preceding: Hex[], availableWad: bigint, no
   if (availableWad < parseUnits(String(minOpening), 18)) return { skipped: 'too little liquidity for an arb', available_usds: formatUnits(availableWad > 0n ? availableWad : 0n, 18) }
   try {
     const arb = await verifyArb2(client as any, getAddress(cfg.arb2_address), getAddress(MAIN_WALLET), ctx.keeper.address)
-    const prio = Number(cfg.priority_gwei ?? 1)
+    // The builder is paid out of the arb's profit, not out of the bot key's ETH, so the priority fee stays minimal.
+    const prio = Number(cfg.arb_priority_gwei ?? 0.05)
     const quoter = cfg.arb_quoter_address ? await verifyQuoter(client as any, getAddress(cfg.arb_quoter_address)).catch(() => undefined) : undefined
     const r: any = await planDirect({
       client: client as any,
@@ -735,7 +736,16 @@ async function runRoute(ctx: Ctx, o: { route: 'end of block' | 'Safe route' | 'b
   const targets = Array.from({ length: o.nTargets }, (_, i) => head.number + 1n + BigInt(i))
   const exit = await exitLeg(ctx, p, o.n, o.extraGas ?? 0n, arbOn ? ARB_GAS_LIMIT : 0n)
   const sent: any[] = []
-  if (isLeg(exit) && !LOCAL_SUBMIT) sent.push(...await sendBundles(keeper, [[...o.preceding, exit.raw]], targets, o.publicCopy && cfg.public_broadcast ? exit.raw : undefined))
+  // Where the opening only exists inside our own bundle (a Safe repayment we execute, a private test deposit), a
+  // withdrawal sent on its own lets the builder pair it with somebody else's arb: bots whose transaction simply takes
+  // whatever is withdrawable when it runs did exactly that on 25 Nov. So there the arb is planned first (for at most
+  // 2.5 s) and travels in the same bundle, marked as allowed to fail so that it can never hold the withdrawal back.
+  const exclusive = o.route === 'Safe route' || o.route === 'test, alone'
+  const holdExit = exclusive && isLeg(exit) && !!(cfg.arb_enabled && cfg.arb2_address) && p.availableAfter >= parseUnits(String(cfg.arb_min_usds ?? 1000), 18)
+  const sendExitAlone = async () => {
+    if (isLeg(exit) && !LOCAL_SUBMIT) sent.push(...await sendBundles(keeper, [[...o.preceding, exit.raw]], targets, o.publicCopy && cfg.public_broadcast ? exit.raw : undefined))
+  }
+  if (!holdExit) await sendExitAlone()
   const exitMs = Date.now() - t0
 
   // An exit that was priced out by the fee policy leaves its liquidity for the arb.
@@ -743,14 +753,17 @@ async function runRoute(ctx: Ctx, o: { route: 'end of block' | 'Safe route' | 'b
   const before = isLeg(exit) ? [...o.preceding, exit.raw] : o.preceding
   const arbNonce = isLeg(exit) ? o.n + 1 : o.n
   // Direct route first: it needs no outside quote and is out within about a second.
-  const direct = await directArbLeg(ctx, before, available, arbNonce, o.tipShare)
-  if (isLeg(direct) && !LOCAL_SUBMIT) sent.push(...await sendBundles(keeper, [[...before, direct.raw]], targets))
+  const direct: Leg | Skip = holdExit
+    ? await Promise.race([directArbLeg(ctx, before, available, arbNonce, o.tipShare), sleep(LOCAL_SUBMIT ? 30_000 : 2500).then((): Skip => ({ skipped: 'arb plan took too long' }))])
+    : await directArbLeg(ctx, before, available, arbNonce, o.tipShare)
+  if (isLeg(direct) && !LOCAL_SUBMIT) sent.push(...await sendBundles(keeper, [[...before, direct.raw]], targets, undefined, holdExit ? [direct.hash] : undefined))
+  if (holdExit && !isLeg(direct)) await sendExitAlone()
   const directMs = Date.now() - t0
   // The KyberSwap route also reaches resting limit orders, which matters for large openings. It is slower, so it
   // goes out as a second bundle (same nonce: at most one of the two can land) or stands in when the direct one has no plan.
   const wantKyber = kyberOn && (!isLeg(direct) || available >= parseUnits(String(cfg.arb_kyber_min_usds ?? 150000), 18))
   const kyber: Leg | Skip = wantKyber ? await arbLeg(ctx, before, available, arbNonce, o.tipShare, ladder) : { skipped: 'not needed at this size' }
-  if (isLeg(kyber) && !LOCAL_SUBMIT) sent.push(...await sendBundles(keeper, [[...before, kyber.raw]], targets))
+  if (isLeg(kyber) && !LOCAL_SUBMIT) sent.push(...await sendBundles(keeper, [[...before, kyber.raw]], targets, undefined, holdExit ? [kyber.hash] : undefined))
   // The better-paying of the two is the one a builder would take.
   const tipOf = (l: Leg | Skip) => (isLeg(l) ? Number(l.detail.tip_usds ?? 0) : -1)
   const arb: Leg | Skip = tipOf(kyber) > tipOf(direct) ? kyber : isLeg(direct) ? direct : kyber
@@ -766,6 +779,7 @@ async function runRoute(ctx: Ctx, o: { route: 'end of block' | 'Safe route' | 'b
     arb: isLeg(arb) ? arb.detail : arb,
     arb_direct: isLeg(direct) ? direct.detail : direct,
     arb_kyber: isLeg(kyber) ? kyber.detail : kyber,
+    one_bundle: holdExit && isLeg(direct),
     ms: { probe: probeMs, exit_sent: exitMs, direct_arb_sent: directMs, total: Date.now() - t0 },
     builders: summarizeSends(sent),
     ...o.meta,
@@ -978,6 +992,16 @@ async function tick(ctx: Ctx) {
 
 // Two independent feeds: each node only sees part of the public queue (on 25 Nov one showed well under half of what the other did).
 const PENDING_WS = ['wss://ethereum-rpc.publicnode.com', 'wss://0xrpc.io/eth']
+// Optional third feed: an Alchemy key in the function's secrets (any name containing "alchemy"; a bare key or a full
+// endpoint URL both work). Alchemy filters on its side, so it only sends transactions addressed to the contracts below.
+function alchemyKey(): string {
+  const hit = Object.entries(Deno.env.toObject()).find(([k, v]) => /alchemy/i.test(k) && v)
+  if (!hit) return ''
+  const v = hit[1].trim()
+  const m = v.match(/\/v2\/([A-Za-z0-9_-]{16,})/)
+  return m ? m[1] : /^[A-Za-z0-9_-]{16,}$/.test(v) ? v : ''
+}
+const ENTRY_POINTS = ['0x5FF137D4b0FDCD49DcA30c7CF57E578a026d2789', '0x0000000071727De22E5E9d8BAf0edAc6f37da032'] // ERC-4337 bundlers
 async function rawTransaction(hash: Hex): Promise<Hex | null> {
   for (const url of RPC_URLS) {
     try {
@@ -1027,11 +1051,11 @@ async function mempoolWatch(ctx: Ctx) {
     })
   }
   const sockets = new Set<WebSocket>()
-  const connect = (url: string) => {
+  const connect = (url: string, params: unknown[] = ['newPendingTransactions', true]) => {
     if (closed || Date.now() > deadline - 3000) return
     const ws = new WebSocket(url)
     sockets.add(ws)
-    ws.onopen = () => ws.send(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_subscribe', params: ['newPendingTransactions', true] }))
+    ws.onopen = () => ws.send(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_subscribe', params }))
     ws.onmessage = (m) => {
       try {
         const r = JSON.parse(String(m.data))?.params?.result
@@ -1043,10 +1067,15 @@ async function mempoolWatch(ctx: Ctx) {
     }
     ws.onclose = () => {
       sockets.delete(ws)
-      if (!closed) setTimeout(() => connect(url), 1500)
+      if (!closed) setTimeout(() => connect(url, params), 1500)
     }
   }
-  PENDING_WS.forEach(connect)
+  PENDING_WS.forEach((u) => connect(u))
+  const alchemy = alchemyKey()
+  if (alchemy) {
+    const toAddress = [LOCKSTAKE_ENGINE, ST_USDS, ...String(cfg.watch_safe ?? '').split(',').map((x) => x.trim()).filter(Boolean), ...ENTRY_POINTS]
+    connect(`wss://eth-mainnet.g.alchemy.com/v2/${alchemy}`, ['alchemy_pendingTransactions', { toAddress, hashesOnly: false }])
+  }
   while (Date.now() < deadline) await sleep(1000)
   closed = true
   for (const ws of sockets) {
@@ -1141,6 +1170,7 @@ async function status(ctx: Ctx) {
     }
   }
   out.mempool_watch = !!ctx.config.mempool_enabled
+  out.alchemy_feed = !!alchemyKey()
   out.safe_api_key = !!env('SAFE_API_KEY')
   out.available_usds = formatUnits(await availableUsds(client as any), 18)
   return out

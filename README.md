@@ -127,9 +127,15 @@ Three routes. Each one first simulates the withdrawal followed by a read-only "l
 
 The arb goes out in up to two bundles: the direct one (`arb2.ts`, sized with exact quotes from `StUsdsQuoter`, ready about a second after the liquidity is measured) and, from `arb_kyber_min_usds` of freed liquidity on, the KyberSwap one (`arb.ts`), which is slower but also reaches resting limit orders. Both use the same nonce, so at most one can land.
 
+On routes where the opening only exists inside the bot's own bundle (a Safe repayment it executes, a private test deposit), the withdrawal and the arb travel as one bundle, with the arb marked as allowed to fail. Sent separately, a builder can pair the withdrawal with someone else's arb: several bots submit a transaction every block that simply takes whatever is withdrawable when it runs, which is how the first live test on 25 Nov lost its arb.
+
+The pending-transaction watch listens to two public feeds and, when an Alchemy key is present in the function's secrets (any name containing "alchemy"), to Alchemy's filtered feed as a third.
+
+`drill` with `mode: "alone"` or `mode: "race"` runs a live test: the bot key deposits USDS into stUSDS inside the bot's own bundle (alone) or also publicly (race), and the usual withdrawal and arb follow.
+
 Overlapping runs are de-duplicated through `stusds_exit_claim`. The arb sizes itself from the price ladder the collector keeps fresh, so only a handful of KyberSwap calls happen at fire time. `simcheck` runs the lens live; `status` reports wallets, code checks and whether the Safe API key is present.
 
-Settings (`stusds_alert.exit_config`): `enabled`, `target_name`/`helper_address`, `fee_bps` (exit fee cap, default 10 = 0.1%), `fee_floor_usd`, `safe_route`, `watch_safe` (comma-separated), `safe_poll_seconds` (10), `arb_enabled`, `arb_address`, `arb_tip_share_safe` (0.3), `arb_tip_share_race` (0.99: winners of open races give the builder about 99% of the profit), `arb_min_net_usd` (2), `arb2_address`, `arb_quoter_address`, `arb_kyber_min_usds` (100000), `mempool_enabled`.
+Settings (`stusds_alert.exit_config`): `enabled`, `target_name`/`helper_address`, `fee_bps` (exit fee cap, default 10 = 0.1%), `fee_floor_usd`, `safe_route`, `watch_safe` (comma-separated), `safe_poll_seconds` (10), `arb_enabled`, `arb_address`, `arb_tip_share_safe` (0.3), `arb_tip_share_race` (starts at 0.995: winners of open races give the builder about 99% of the profit), `arb_min_net_usd` (0.2), `arb_tip_share_floor`/`arb_tip_share_cap`/`arb_tip_step_down`/`arb_tip_step_up` (0.70 / 0.995 / 0.01 / 0.03: the race share moves down after a win and up after a loss), `arb_min_usds` (150), `arb_priority_gwei` (0.05), `arb2_address`, `arb_quoter_address`, `arb_kyber_min_usds` (100000), `mempool_enabled`.
 
 Tests: `cd contracts && forge test` (67 fork tests; `node test/fixtures/build-arb-fixture.mjs` refreshes the Kyber calldata fixture), `deno run --allow-net supabase/functions/stusds-exit/pending_test.ts` (pending-transaction decoder against real transactions).
 

@@ -207,7 +207,7 @@ export async function planDirect(opts: {
   let tipUsds = (size.profit * BigInt(Math.round(Math.min(Math.max(opts.tipShare, 0), 0.999) * 10_000))) / 10_000n
   if (size.profit - tipUsds < floor) tipUsds = size.profit - floor
   tipUsds = (tipUsds / 10n ** 12n) * 10n ** 12n
-  if (tipUsds < WAD) tipUsds = 0n
+  if (tipUsds < WAD / 20n) tipUsds = 0n // under 0.05 USDS the conversion is not worth its gas
   // The outcome is exact for the pool as quoted. If someone moves the pool first, any run that still nets a dollar may land.
   const keep = size.profit - tipUsds
   const minNet = keep / 2n > WAD ? WAD : keep / 2n
