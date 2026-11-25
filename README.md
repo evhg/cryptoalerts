@@ -134,7 +134,9 @@ Besides reacting to what it sees, the bot keeps a standing withdrawal in front o
 
 The pending-transaction watch listens to two public feeds and, when an Alchemy key is present in the function's secrets (any name containing "alchemy"), to Alchemy's filtered feed as a third.
 
-`drill` with `mode: "alone"` or `mode: "race"` runs a live test: the bot key deposits USDS into stUSDS inside the bot's own bundle (alone) or also publicly (race), and the usual withdrawal and arb follow.
+`drill` with `mode: "alone"` or `mode: "race"` runs a live test: the bot key deposits USDS into stUSDS inside the bot's own bundle (alone) or also publicly (race), and the usual withdrawal and arb follow. A plain `drill` with `private: true` and `from: "test"` deposits from the test wallet instead, which is the test for the standing bundles (they cannot follow one of the bot key's own transactions); adding `builders: [...]` and `targets: N` keeps that deposit with the named builders for up to N blocks, so it can only land in a block one of them builds.
+
+Live results, 25 Nov (Bangkok time): a 400 USDS public race at 23:02 was won (withdrawal and arb both landed behind the deposit in a Titan block). Two private deposits kept with BuilderNet at 23:20 and 23:23 showed the standing arb losing twice: the first opening was taken in the same block by another holder's standing withdrawal (helper `0x8acf82d9…`, about 190k gas, paying 3.04e13 wei per USDS), the second was left alone in the deposit's block and taken two blocks later by a 350k-gas arb. Replayed on a fork, our standing arb was valid both times and offered more ETH in total but two to three times less per unit of gas (it uses about 1.17M gas).
 
 Overlapping runs are de-duplicated through `stusds_exit_claim`. The arb sizes itself from the price ladder the collector keeps fresh, so only a handful of KyberSwap calls happen at fire time. `simcheck` runs the lens live; `status` reports wallets, code checks and whether the Safe API key is present.
 
