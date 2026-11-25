@@ -134,3 +134,5 @@ Tests: `cd contracts && forge test` (42 fork tests; `node test/fixtures/build-ar
 `POST {"backfill": {"from": <block>, "to": <block>}}` loads history for an older block range.
 
 The live dashboard is a Claude dashboard artifact. Its page is `dashboard/index.html` and its queries are in `dashboard/datasets.json`; each one reads a view named `stusds_alert.v_dash_*` through the Supabase connector. All times are formatted in Bangkok time in the views.
+
+A standalone copy for any browser lives in `dashboard/vercel` (built by `python3 dashboard/build-vercel.py` from the same page). It reads `public.stusds_board(p_key)`, which returns the same views as one JSON object and answers only to the random key stored in `stusds_alert.config.board_key`. The key travels in the link's fragment (`#k=...`), is kept in the browser and never reaches Vercel. Changing `board_key` cuts off every old link.
