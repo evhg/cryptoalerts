@@ -2,7 +2,7 @@
 alter table stusds_alert.exit_config add column if not exists arb2_address text;
 alter table stusds_alert.exit_config add column if not exists arb_quoter_address text;
 -- From this much freed liquidity on, the slower KyberSwap route (which also reaches resting limit orders) is sent as a second bundle.
-alter table stusds_alert.exit_config add column if not exists arb_kyber_min_usds numeric not null default 150000;
+alter table stusds_alert.exit_config add column if not exists arb_kyber_min_usds numeric not null default 100000;
 -- The earlier ceiling of 90% on the builder's share no longer matches the market.
 alter table stusds_alert.exit_config drop constraint if exists exit_config_arb_tip_share_race_check;
 alter table stusds_alert.exit_config add constraint exit_config_arb_tip_share_race_check check (arb_tip_share_race >= 0 and arb_tip_share_race <= 0.999);
