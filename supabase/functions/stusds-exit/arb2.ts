@@ -128,12 +128,13 @@ const WAD = 10n ** 18n
  * How much USDS to spend: the most profitable amount whose shares Sky can pay
  * out in full. Returns null when no size makes a profit.
  */
-export async function sizeDirect(client: PublicClient, availableWad: bigint, quoter?: Hex) {
+export async function sizeDirect(client: PublicClient, availableWad: bigint, quoter?: Hex, minBuyUsds = 500) {
   const nav = await client.readContract({ address: ST_USDS, abi: stAbi, functionName: 'convertToAssets', args: [WAD] })
   // What the bought shares redeem for must fit in what Sky can pay; a share costs less than it redeems for, so the spend does too.
   const cap = (availableWad * 999n) / 1000n
   const value = (shares: bigint) => (shares * nav) / WAD
-  const xs = GRID.map((g) => (((cap * g) / 1000n) / WAD) * WAD).filter((x) => x >= 500n * WAD)
+  const minBuy = BigInt(Math.max(1, Math.round(minBuyUsds))) * WAD
+  const xs = GRID.map((g) => (((cap * g) / 1000n) / WAD) * WAD).filter((x) => x >= minBuy)
   if (!xs.length) return null
   const grid = (await quoteShares(client, xs, quoter)).map((q, i) => ({ x: xs[i], ...q, value: value(q.shares) }))
   type Pick = { x: bigint; lp: bigint; shares: bigint; value: bigint }
@@ -150,7 +151,7 @@ export async function sizeDirect(client: PublicClient, availableWad: bigint, quo
     const a = fitsIdx >= 0 ? grid[fitsIdx] : { x: 0n, value: 0n }
     const target = a.x + ((cap - a.value) * (over.x - a.x)) / (over.value - a.value)
     // The value curve bends downward, so the straight line overshoots a little: try a few sizes just under it.
-    const tries = [9998n, 9993n, 9985n, 9970n, 9940n, 9900n].map((k) => (((target * k) / 10000n) / WAD) * WAD).filter((x) => x > a.x && x >= 500n * WAD)
+    const tries = [9998n, 9993n, 9985n, 9970n, 9940n, 9900n].map((k) => (((target * k) / 10000n) / WAD) * WAD).filter((x) => x > a.x && x >= minBuy)
     if (tries.length) (await quoteShares(client, tries, quoter)).forEach((q, i) => consider({ x: tries[i], ...q, value: value(q.shares) }))
   }
   const b = best as Pick | null
@@ -195,9 +196,10 @@ export async function planDirect(opts: {
   simulate: BundleSim
   tipShare: number
   minNetUsds: number
+  minBuyUsds?: number
 }) {
   const t0 = Date.now()
-  const size = await sizeDirect(opts.client, opts.availableWad, opts.quoter)
+  const size = await sizeDirect(opts.client, opts.availableWad, opts.quoter, opts.minBuyUsds)
   const sizedMs = Date.now() - t0
   if (!size) return { skipped: 'no profitable size at the pool' }
   const floor = parseUnits(String(opts.minNetUsds), 18)

@@ -622,7 +622,7 @@ async function arbLeg(ctx: Ctx, preceding: Hex[], availableWad: bigint, nonce: n
   const cfg = ctx.config
   if (!cfg.arb_enabled || !cfg.arb_address || !ctx.keeper) return { skipped: 'arb off' }
   if (!ladder || !ladder.quotes.length) return { skipped: 'no DEX quotes' }
-  if (availableWad < parseUnits('1000', 18)) return { skipped: 'too little liquidity for an arb', available_usds: formatUnits(availableWad > 0n ? availableWad : 0n, 18) }
+  if (availableWad < parseUnits(String(Math.max(Number(cfg.arb_min_usds ?? 1000), 1000)), 18)) return { skipped: 'too little liquidity for an arb', available_usds: formatUnits(availableWad > 0n ? availableWad : 0n, 18) }
   try {
     const arb = await verifyArb(client as any, getAddress(cfg.arb_address), getAddress(MAIN_WALLET), ctx.keeper.address)
     const prio = Number(cfg.priority_gwei ?? 1)
@@ -651,7 +651,8 @@ async function arbLeg(ctx: Ctx, preceding: Hex[], availableWad: bigint, nonce: n
 async function directArbLeg(ctx: Ctx, preceding: Hex[], availableWad: bigint, nonce: number, tipShare: number): Promise<Leg | Skip> {
   const cfg = ctx.config
   if (!cfg.arb_enabled || !cfg.arb2_address || !ctx.keeper) return { skipped: 'direct arb off' }
-  if (availableWad < parseUnits('1000', 18)) return { skipped: 'too little liquidity for an arb', available_usds: formatUnits(availableWad > 0n ? availableWad : 0n, 18) }
+  const minOpening = Number(cfg.arb_min_usds ?? 1000)
+  if (availableWad < parseUnits(String(minOpening), 18)) return { skipped: 'too little liquidity for an arb', available_usds: formatUnits(availableWad > 0n ? availableWad : 0n, 18) }
   try {
     const arb = await verifyArb2(client as any, getAddress(cfg.arb2_address), getAddress(MAIN_WALLET), ctx.keeper.address)
     const prio = Number(cfg.priority_gwei ?? 1)
@@ -666,6 +667,7 @@ async function directArbLeg(ctx: Ctx, preceding: Hex[], availableWad: bigint, no
       simulate: (raws) => simulateBundle(ctx, raws),
       tipShare,
       minNetUsds: Number(cfg.arb_min_net_usd ?? 25),
+      minBuyUsds: minOpening / 2,
     })
     if (!r.raw) return { skipped: r.skipped ?? 'no plan', ...r }
     const { raw, hash, ...rest } = r
@@ -678,6 +680,7 @@ async function directArbLeg(ctx: Ctx, preceding: Hex[], availableWad: bigint, no
 /** Wait for whichever of our transactions lands, log it and tell the user. */
 async function watchLanding(ctx: Ctx, seenBlock: number, route: string, exit: Leg | null, arbs: Leg[]) {
   const cfg = ctx.config
+  const landed = { exit: false, arb: false }
   const pending = new Map<Hex, 'exit' | 'arb'>()
   if (exit) pending.set(exit.hash, 'exit')
   for (const a of arbs) pending.set(a.hash, 'arb')
@@ -689,6 +692,7 @@ async function watchLanding(ctx: Ctx, seenBlock: number, route: string, exit: Le
       pending.delete(hash)
       const detail = { route, kind, hash, block: Number(receipt.blockNumber), index: receipt.transactionIndex, status: receipt.status, gas_used: Number(receipt.gasUsed), blocks_after_seen: Number(receipt.blockNumber) - seenBlock }
       await log(ctx, receipt.blockNumber, 'included', detail)
+      if (receipt.status === 'success') landed[kind] = true
       if (kind === 'exit') {
         await notify(
           ctx,
@@ -703,6 +707,7 @@ async function watchLanding(ctx: Ctx, seenBlock: number, route: string, exit: Le
     }
   }
   if (pending.size) await log(ctx, seenBlock, 'not_included', { route, hashes: [...pending.keys()] })
+  return landed
 }
 
 /**
@@ -711,7 +716,7 @@ async function watchLanding(ctx: Ctx, seenBlock: number, route: string, exit: Le
  * arb takes what is left. The exit bundle is sent as soon as it is ready; the
  * bundle that also carries the arb follows, and builders take whichever is best.
  */
-async function runRoute(ctx: Ctx, o: { route: 'end of block' | 'Safe route' | 'backrun'; seenBlock: number; preceding: Hex[]; n: number; extraGas?: bigint; tipShare: number; nTargets: number; publicCopy?: boolean; meta?: Record<string, unknown> }) {
+async function runRoute(ctx: Ctx, o: { route: 'end of block' | 'Safe route' | 'backrun' | 'test, alone' | 'test, public race'; seenBlock: number; preceding: Hex[]; n: number; extraGas?: bigint; tipShare: number; nTargets: number; publicCopy?: boolean; meta?: Record<string, unknown> }) {
   const t0 = Date.now()
   const cfg = ctx.config
   const keeper = ctx.keeper!
@@ -770,8 +775,22 @@ async function runRoute(ctx: Ctx, o: { route: 'end of block' | 'Safe route' | 'b
     return { skipped: 'nothing for us' }
   }
   await log(ctx, o.seenBlock, 'fired', detail)
-  await watchLanding(ctx, o.seenBlock, o.route, isLeg(exit) ? exit : null, LOCAL_SUBMIT ? (isLeg(arb) ? [arb] : []) : [direct, kyber].filter(isLeg))
-  return { fired: true }
+  const landed = await watchLanding(ctx, o.seenBlock, o.route, isLeg(exit) ? exit : null, LOCAL_SUBMIT ? (isLeg(arb) ? [arb] : []) : [direct, kyber].filter(isLeg))
+  // Open races teach the bid: after a win offer builders a little less next time, after a loss a little more.
+  const contested = o.route === 'backrun' || o.route === 'end of block' || o.route === 'test, public race'
+  if (contested && (isLeg(direct) || isLeg(kyber))) {
+    let outcome: 'won' | 'lost' | null = landed.arb ? 'won' : null
+    if (!outcome) {
+      // Only a loss if somebody else took the liquidity we bid for.
+      const left = await availableUsds(client as any).catch(() => null)
+      if (left !== null && left < available / 5n) outcome = 'lost'
+    }
+    if (outcome) {
+      const r = await db('stusds_exit_race_result', { p_secret: ctx.secret, p_won: outcome === 'won', p_detail: { route: o.route, tip_share: o.tipShare, opening_usds: formatUnits(available, 18) } }).catch(() => null)
+      console.log('race', outcome, 'tip share now', r?.tip_share)
+    }
+  }
+  return { fired: true, landed }
 }
 
 /** At most one isolate acts on a given event (cron runs overlap on purpose). Fails open. */
@@ -957,7 +976,8 @@ async function tick(ctx: Ctx) {
 // exit and the arb directly behind them, as one bundle that only lands if the
 // repayment does, in the same block.
 
-const PENDING_WS = ['wss://ethereum-rpc.publicnode.com']
+// Two independent feeds: each node only sees part of the public queue (on 25 Nov one showed well under half of what the other did).
+const PENDING_WS = ['wss://ethereum-rpc.publicnode.com', 'wss://0xrpc.io/eth']
 async function rawTransaction(hash: Hex): Promise<Hex | null> {
   for (const url of RPC_URLS) {
     try {
@@ -989,9 +1009,11 @@ async function mempoolWatch(ctx: Ctx) {
   let closed = false
   let candidates = 0
   let busy = Promise.resolve()
-  const handle = (tx: any) => {
+  const firstFrom: Record<string, number> = {}
+  const handle = (tx: any, feed: string) => {
     if (!tx?.hash || seen.has(tx.hash)) return
     seen.add(tx.hash)
+    firstFrom[feed] = (firstFrom[feed] ?? 0) + 1
     if (String(tx.from ?? '').toLowerCase() === ctx.keeper!.address.toLowerCase()) return
     if (!isCandidate(tx)) return
     const hint = amountHint(tx)
@@ -1013,7 +1035,7 @@ async function mempoolWatch(ctx: Ctx) {
     ws.onmessage = (m) => {
       try {
         const r = JSON.parse(String(m.data))?.params?.result
-        if (r && typeof r === 'object') handle(r)
+        if (r && typeof r === 'object') handle(r, new URL(url).host)
       } catch { /* ignore malformed frames */ }
     }
     ws.onerror = () => {
@@ -1032,7 +1054,7 @@ async function mempoolWatch(ctx: Ctx) {
   }
   await busy
   // Heartbeat for the dashboard: the pending feed is alive and this many transactions went past.
-  await db('stusds_exit_heartbeat', { p_secret: ctx.secret, p_kind: 'mempool', p_detail: { seen: seen.size, candidates } }).catch(() => null)
+  await db('stusds_exit_heartbeat', { p_secret: ctx.secret, p_kind: 'mempool', p_detail: { seen: seen.size, candidates, first_seen_by: firstFrom } }).catch(() => null)
   console.log(`mempool run done: ${seen.size} pending transactions seen, ${candidates} candidates`)
 }
 
@@ -1194,6 +1216,21 @@ async function drill(ctx: Ctx, body: any) {
     await sendPublic(k, { to: USDS, data: encodeFunctionData({ abi: tokenAbi, functionName: 'approve', args: [ST_USDS, maxUint256] }), gas: 80_000n })
   }
   const req = { to: ST_USDS as Hex, data: encodeFunctionData({ abi: tokenAbi, functionName: 'deposit', args: [amount, k.address] }), gas: 450_000n }
+  // Live tests of the whole chain. 'alone': the deposit travels only inside our own bundle, in front of the exit and
+  // the arb, so nobody can compete. 'race': the deposit is also broadcast publicly, and every bot may follow it.
+  if (body.mode === 'alone' || body.mode === 'race') {
+    const cfg = ctx.config
+    const [n, head] = await Promise.all([client.getTransactionCount({ address: k.address, blockTag: 'latest' }), getHead()])
+    const dep = await signTx(k, req, Number(cfg.priority_gwei ?? 1), n)
+    await log(ctx, Number(head.number), 'drill_deposit', { usds: body.usds, mode: body.mode, tx: dep.hash })
+    if (body.mode === 'race' && !LOCAL_SUBMIT) await Promise.all(PUBLIC_MEMPOOL.map((u) => publicSend(u, dep.raw)))
+    const out = await runRoute(ctx, {
+      route: body.mode === 'race' ? 'test, public race' : 'test, alone', seenBlock: Number(head.number), preceding: [dep.raw], n: n + 1,
+      tipShare: Number(body.mode === 'race' ? cfg.arb_tip_share_race ?? 0.99 : cfg.arb_tip_share_safe ?? 0.3), nTargets: 3,
+      meta: { test_deposit: dep.hash, test_usds: body.usds },
+    })
+    return { mode: body.mode, deposit_tx: dep.hash, ...out }
+  }
   // A public deposit is backrun in the same block by mempool bots; a private one
   // only becomes visible once its block is out, which is the race the exit bot runs.
   const r = body.private ? (await sendPrivate(k, req, 2)).receipt : await sendPublic(k, req)
