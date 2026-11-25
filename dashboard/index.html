@@ -201,7 +201,7 @@
       description: 'Takes the JSON rows out of the Supabase answer, turns numeric text into numbers, and (for the snapshot) spreads the stored snapshot fields into columns.',
       fn: ({answer}) => {
         const text = typeof answer === 'string' ? answer : JSON.stringify(answer);
-        const m = text.match(/<untrusted-data-[^>]*>\s*([\s\S]*?)\s*<\/untrusted-data-/);
+        const m = text.match(/<untrusted-data-[^>]*>\s*(\[[\s\S]*\])\s*<\/untrusted-data-/);
         if (!m) throw new Error(text.slice(0, 240));
         const num = (v) => (typeof v === 'string' && /^-?\d+(\.\d+)?$/.test(v) && v.length < 16 ? Number(v) : v);
         return JSON.parse(m[1]).map((row) => {
