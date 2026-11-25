@@ -334,13 +334,18 @@ async function publicSend(url: string, raw: Hex) {
 }
 
 /** Send a transaction only as a bundle to builders (never the public mempool) and wait for it. */
-async function sendPrivate(account: PrivateKeyAccount, req: TxReq, priorityGwei: number) {
+async function sendPrivate(account: PrivateKeyAccount, req: TxReq, priorityGwei: number, o: { only?: string[]; blocks?: number } = {}) {
   const { raw, hash, head } = await signTx(account, req, priorityGwei)
-  const targets = [head.number + 1n, head.number + 2n, head.number + 3n]
+  const blocks = Math.min(Math.max(o.blocks ?? 3, 1), 25)
+  const targets = Array.from({ length: blocks }, (_, i) => head.number + BigInt(i + 1))
+  // `only` keeps the transaction with the named builders, so it can only land in a block one of them builds.
+  const builders = o.only?.length ? BUILDERS.filter((b) => o.only!.includes(b.name)) : BUILDERS
+  if (!builders.length) throw new Error(`no such builder: ${o.only}`)
   const sent = await Promise.all(
-    BUILDERS.flatMap((b) => targets.map((t) => builderCall(b, account, 'eth_sendBundle', [{ txs: [raw], blockNumber: toHex(t) }]))),
+    builders.flatMap((b) => targets.map((t) => builderCall(b, account, 'eth_sendBundle', [{ txs: [raw], blockNumber: toHex(t) }]))),
   )
-  for (let i = 0; i < 24; i++) {
+  // The wait stays inside the function's time limit; a later landing is still picked up by the block scan.
+  for (let i = 0; i < Math.min(Math.max(24, Math.ceil((blocks * 12 + 24) / 2.5)), 52); i++) {
     await sleep(2500)
     const receipt = await client.getTransactionReceipt({ hash }).catch(() => null)
     if (receipt) {
@@ -1446,9 +1451,11 @@ async function drill(ctx: Ctx, body: any) {
   }
   // A public deposit is backrun in the same block by mempool bots; a private one
   // only becomes visible once its block is out, which is the race the exit bot runs.
-  const r = body.private ? (await sendPrivate(k, req, 2)).receipt : await sendPublic(k, req)
-  await log(ctx, r.blockNumber, 'drill_deposit', { usds: body.usds, private: !!body.private, from: fromTest ? 'test wallet' : 'bot key', tx: r.transactionHash, index: r.transactionIndex })
-  return { deposited_usds: body.usds, private: !!body.private, from: fromTest ? 'test wallet' : 'bot key', block: r.blockNumber, index: r.transactionIndex, tx: r.transactionHash }
+  const only = Array.isArray(body.builders) && body.builders.length ? body.builders.map(String) : undefined
+  const r = body.private ? (await sendPrivate(k, req, 2, { only, blocks: Number(body.targets ?? 3) })).receipt : await sendPublic(k, req)
+  const detail = { usds: body.usds, private: !!body.private, from: fromTest ? 'test wallet' : 'bot key', ...(body.private && only ? { builders_only: only } : {}) }
+  await log(ctx, r.blockNumber, 'drill_deposit', { ...detail, tx: r.transactionHash, index: r.transactionIndex })
+  return { deposited_usds: body.usds, ...detail, block: r.blockNumber, index: r.transactionIndex, tx: r.transactionHash }
 }
 
 /** Return test funds to the main wallet. The destination is fixed. */
