@@ -35,6 +35,7 @@ import {
   keccak256,
   maxUint256,
   parseAbi,
+  parseAbiItem,
   parseEther,
   parseGwei,
   parseUnits,
@@ -46,6 +47,7 @@ import { mainnet } from 'npm:viem@2.58.4/chains'
 import { EXIT_CREATION_BYTECODE } from './bytecode.ts'
 import { ARB_GAS_LIMIT, arbDeployData, availableUsds, type Ladder, ladderQuotes, planArb, verifyArb } from './arb.ts'
 import { arb2DeployData, planDirect, quoterDeployData, verifyArb2, verifyQuoter } from './arb2.ts'
+import { ARB3_GAS_LIMIT, arb3Abi, arb3DeployData, standingArbData, verifyArb3 } from './arb3.ts'
 import { amountHint, isCandidate, rebuildRaw } from './pending.ts'
 
 declare const EdgeRuntime: { waitUntil(p: Promise<unknown>): void } | undefined
@@ -1055,27 +1057,63 @@ async function standingTiers(ctx: Ctx, n: number) {
   return { owner, position_usds: formatUnits(value, 18), tiers }
 }
 
+/**
+ * The standing arb: one transaction per bid level that takes whatever is withdrawable when it runs (the contract
+ * sizes itself). It follows a standing withdrawal by nonce when there is one, so the owner's withdrawal always goes
+ * first; with nothing to withdraw it stands alone.
+ */
+async function standingArbs(ctx: Ctx, nonce: number) {
+  const cfg = ctx.config
+  if (!cfg.arb_enabled || cfg.standing_arb === false || !cfg.arb3_address || !ctx.keeper) return null
+  const arb = await verifyArb3(client as any, getAddress(cfg.arb3_address), getAddress(MAIN_WALLET), ctx.keeper.address)
+  const prio = Number(cfg.arb_priority_gwei ?? 0.05)
+  const common = { minOpeningUsds: Number(cfg.arb_min_usds ?? 1000), maxSpendUsds: Number(cfg.arb_auto_max_spend ?? 400000), minNetUsds: Number(cfg.arb_min_net_usd ?? 0.2) }
+  const make = async (tipShare: number) => {
+    const signed = await signTx(ctx.keeper!, { to: arb, data: standingArbData({ ...common, tipShare }), gas: ARB3_GAS_LIMIT }, prio, nonce)
+    return { raw: signed.raw, hash: signed.hash, tip_share: tipShare }
+  }
+  const normal = await make(Number(cfg.arb_tip_share_race ?? 0.99))
+  const high = Number(cfg.arb_tip_share_buildernet ?? 0)
+  return { arb, normal, refunding: high > normal.tip_share ? await make(high) : null }
+}
+
 /** Runs beside the pending-transaction watch: for every new block, put the standing bundles in front of the builders. */
 async function standingLoop(ctx: Ctx, deadline: number) {
   const cfg = ctx.config
-  if (!cfg.enabled || cfg.standing_exit === false || !ctx.keeper || LOCAL_SUBMIT) return
+  if (!cfg.enabled || !ctx.keeper || LOCAL_SUBMIT) return
+  if (cfg.standing_exit === false && (cfg.standing_arb === false || !cfg.arb3_address)) return
   let last = 0n
-  const stats = { blocks: 0, bundles: 0, accepted: 0, idle_blocks: 0, position_usds: '0' }
+  const stats = { blocks: 0, bundles: 0, accepted: 0, idle_blocks: 0, position_usds: '0', arb: false }
   while (Date.now() < deadline - 2000) {
     try {
       const head = await getHead()
       if (head.number > last) {
         last = head.number
         if (await claim(ctx, `standing:${head.number}`)) {
+          await standingLanded(ctx, head.number).catch((e) => console.error('standing landed check', String(e).slice(0, 120)))
           const n = await client.getTransactionCount({ address: ctx.keeper.address, blockTag: 'latest' })
-          const t = await standingTiers(ctx, n)
-          if (!t || !t.tiers.length) stats.idle_blocks++
+          const t = cfg.standing_exit === false ? null : await standingTiers(ctx, n)
+          const tiers = t?.tiers ?? []
+          // Behind a withdrawal the arb takes the next nonce, so it can only ever run after it.
+          const a = await standingArbs(ctx, tiers.length ? n + 1 : n).catch((e) => { console.error('standing arb', String(e).slice(0, 160)); return null })
+          const target = [head.number + 1n]
+          const res: any[] = []
+          const refunders = a?.refunding ? REFUNDING : []
+          const send = async (arbLeg: { raw: Hex; hash: Hex } | null, pick?: Pick) => {
+            if (tiers.length) {
+              // One bundle per size class; the arb rides behind and may fail without holding the withdrawal back.
+              res.push(...await sendBundles(ctx.keeper!, tiers.map((x) => (arbLeg ? [x.raw, arbLeg.raw] : [x.raw])), target, undefined, arbLeg ? [arbLeg.hash] : undefined, pick))
+            } else if (arbLeg) res.push(...await sendBundles(ctx.keeper!, [[arbLeg.raw]], target, undefined, undefined, pick))
+          }
+          if (a?.refunding) await send(a.refunding, { only: refunders })
+          await send(a?.normal ?? null, refunders.length ? { except: refunders } : undefined)
+          if (!res.length) stats.idle_blocks++
           else {
-            const res = await sendBundles(ctx.keeper, t.tiers.map((x) => [x.raw]), [head.number + 1n])
             stats.blocks++
-            stats.bundles += t.tiers.length
+            stats.bundles += Math.max(tiers.length, 1) * (a?.refunding ? 2 : 1)
             stats.accepted += res.filter((r: any) => r.status === 200).length
-            stats.position_usds = t.position_usds
+            stats.position_usds = t?.position_usds ?? '0'
+            stats.arb = !!a
           }
         }
       }
@@ -1085,6 +1123,28 @@ async function standingLoop(ctx: Ctx, deadline: number) {
     await sleep(700)
   }
   await db('stusds_exit_heartbeat', { p_secret: ctx.secret, p_kind: 'standing', p_detail: stats }).catch(() => null)
+}
+
+/** Did a standing bundle land in this block? The contracts' own events say so. */
+async function standingLanded(ctx: Ctx, block: bigint) {
+  const cfg = ctx.config
+  if (cfg.arb3_address) {
+    const logs = await client.getLogs({ address: getAddress(cfg.arb3_address), event: arb3Abi.find((x: any) => x.type === 'event' && x.name === 'Arb') as any, fromBlock: block, toBlock: block })
+    for (const l of logs as any[]) {
+      const net = formatUnits(l.args.net, 18)
+      await log(ctx, block, 'included', { route: 'standing arb', kind: 'arb', hash: l.transactionHash, block: Number(block), index: l.transactionIndex, status: 'success', opening_usds: formatUnits(l.args.available, 18), spent_usds: formatUnits(l.args.spent, 18), net, tip_eth: formatEther(l.args.tipWei) })
+      await notify(ctx, 'stusds:arb', 'stUSDS arb landed (standing bundle)', `About ${Number(net).toLocaleString('en-US', { maximumFractionDigits: 2 })} USDS profit sent to the main wallet from an opening of ${Number(formatUnits(l.args.available, 18)).toLocaleString('en-US', { maximumFractionDigits: 0 })} USDS, block ${block}. https://etherscan.io/tx/${l.transactionHash}`)
+      await db('stusds_exit_race_result', { p_secret: ctx.secret, p_won: true, p_detail: { route: 'standing arb', opening_usds: formatUnits(l.args.available, 18) } }).catch(() => null)
+    }
+  }
+  if (cfg.helper_address && cfg.standing_exit !== false) {
+    const logs = await client.getLogs({ address: getAddress(cfg.helper_address), event: parseAbiItem('event Exit(uint256 shares, uint256 assets, uint256 tip)'), fromBlock: block, toBlock: block })
+    for (const l of logs as any[]) {
+      const usds = formatUnits(l.args.assets, 18)
+      await log(ctx, block, 'included', { route: 'in-block withdrawal', kind: 'exit', hash: l.transactionHash, block: Number(block), index: l.transactionIndex, status: 'success', usds, tip_eth: formatEther(l.args.tip) })
+      await notify(ctx, 'stusds:exit', 'stUSDS withdrawal landed', `${Number(usds).toLocaleString('en-US', { maximumFractionDigits: 2 })} USDS withdrawn (${cfg.target_name}), block ${block}. https://etherscan.io/tx/${l.transactionHash}`)
+    }
+  }
 }
 
 // Two independent feeds: each node only sees part of the public queue (on 25 Nov one showed well under half of what the other did).
@@ -1268,6 +1328,14 @@ async function status(ctx: Ctx) {
         : 'none',
     }
   }
+  if (ctx.config.arb3_address) {
+    out.arb_standing = {
+      address: ctx.config.arb3_address,
+      code: await verifyArb3(client as any, getAddress(ctx.config.arb3_address), getAddress(MAIN_WALLET), ctx.keeper!.address)
+        .then(() => 'verified: tested build, profit to main wallet, bot key as keeper').catch((e) => `REJECTED: ${String(e)}`),
+      max_spend_usds: ctx.config.arb_auto_max_spend ?? 400000,
+    }
+  }
   out.mempool_watch = !!ctx.config.mempool_enabled
   out.alchemy_feed = !!alchemyKey()
   out.safe_api_key = !!env('SAFE_API_KEY')
@@ -1323,6 +1391,15 @@ async function deployArb2(ctx: Ctx) {
   await verifyQuoter(client as any, quoter)
   await log(ctx, receipt.blockNumber, 'deployed_arb2', { address, tx: receipt.transactionHash, quoter, quoter_tx: q.transactionHash })
   return { address, tx: receipt.transactionHash, gas_used: receipt.gasUsed, quoter, quoter_tx: q.transactionHash, quoter_gas_used: q.gasUsed }
+}
+
+/** Deploy the self-sizing arb contract used by the standing arb bundle. */
+async function deployArb3(ctx: Ctx) {
+  const receipt = await sendPublic(ctx.keeper!, { data: arb3DeployData(getAddress(MAIN_WALLET), ctx.keeper!.address), gas: 3_000_000n })
+  const address = receipt.contractAddress!
+  await verifyArb3(client as any, address, getAddress(MAIN_WALLET), ctx.keeper!.address)
+  await log(ctx, receipt.blockNumber, 'deployed_arb3', { address, tx: receipt.transactionHash })
+  return { address, tx: receipt.transactionHash, gas_used: receipt.gasUsed }
 }
 
 /** Test wallet only: give it gas money and approve its exit contract. */
@@ -1449,11 +1526,15 @@ Deno.serve(async (req) => {
         return json(await deployArb(ctx))
       case 'deploy_arb2':
         return json(await deployArb2(ctx))
+      case 'deploy_arb3':
+        return json(await deployArb3(ctx))
       case 'standing_once': {
         // Fork rehearsals only: hand back the standing bundles for the next block.
         if (!LOCAL_SUBMIT) return json({ error: 'unknown action' }, 400)
         const n = await client.getTransactionCount({ address: ctx.keeper!.address, blockTag: 'latest' })
-        return json(await standingTiers(ctx, n))
+        const t = await standingTiers(ctx, n)
+        const a = await standingArbs(ctx, t?.tiers.length ? n + 1 : n)
+        return json({ ...(t ?? { tiers: [], position_usds: '0' }), arb: a })
       }
       case 'simcheck':
         return json(await simcheck(ctx))
