@@ -197,6 +197,7 @@ export async function planDirect(opts: {
   tipShare: number
   minNetUsds: number
   minBuyUsds?: number
+  altTipShare?: number // a second, higher bid for builders that refund overpayment (same run, same nonce)
 }) {
   const t0 = Date.now()
   const size = await sizeDirect(opts.client, opts.availableWad, opts.quoter, opts.minBuyUsds)
@@ -218,7 +219,23 @@ export async function planDirect(opts: {
   const r = sim.results[opts.preceding.length]
   if (!r || r.error || !r.value) return { skipped: `simulation failed: ${r?.error ?? JSON.stringify(sim.raw ?? 'no result').slice(0, 160)}`, buy_usds: formatUnits(size.amountIn, 18) }
   if (BigInt(r.gasUsed ?? 0) * 100n > ARB2_GAS_LIMIT * 95n) return { skipped: 'run too close to its gas limit' }
+  // The same run with a larger tip. Only the tip amount differs from the transaction just simulated, and the
+  // contract's own checks still apply, so it is signed without a second simulation.
+  let alt: { raw: Hex; hash: Hex; tip_usds: string; tip_share: number } | undefined
+  if (opts.altTipShare && opts.altTipShare > opts.tipShare) {
+    let altTip = (size.profit * BigInt(Math.round(Math.min(opts.altTipShare, 0.9995) * 10_000))) / 10_000n
+    const least = WAD / 100n // always keep a cent
+    if (size.profit - altTip < least) altTip = size.profit - least
+    altTip = (altTip / 10n ** 12n) * 10n ** 12n
+    if (altTip > tipUsds) {
+      const altKeep = size.profit - altTip
+      const altPlan = { flash: size.amountIn, buy: plan.buy, tipUsds: altTip, tip: tipSteps(opts.arb, altTip), minNet: altKeep / 2n }
+      const s2 = await opts.sign(opts.arb, encodeFunctionData({ abi: arb2Abi, functionName: 'arb', args: [altPlan] }), ARB2_GAS_LIMIT)
+      alt = { raw: s2.raw, hash: s2.hash, tip_usds: formatUnits(altTip, 18), tip_share: opts.altTipShare }
+    }
+  }
   return {
+    alt,
     raw: signed.raw,
     hash: signed.hash,
     venue: 'Curve pool, direct',

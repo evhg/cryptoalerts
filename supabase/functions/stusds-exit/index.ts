@@ -477,9 +477,13 @@ async function localCommit(bundle: Hex[]) {
 }
 
 /** Send each bundle to every builder for each target block. */
-async function sendBundles(signer: PrivateKeyAccount, bundles: Hex[][], targets: bigint[], publicRaw?: Hex, mayRevert?: Hex[]) {
+// Builders that pay back part of an overpaying bid (BuilderNet's refund rule; the Flashbots relay feeds BuilderNet).
+const REFUNDING = ['buildernet', 'flashbots']
+type Pick = { only?: string[]; except?: string[] }
+async function sendBundles(signer: PrivateKeyAccount, bundles: Hex[][], targets: bigint[], publicRaw?: Hex, mayRevert?: Hex[], pick?: Pick) {
+  const to = BUILDERS.filter((b) => (!pick?.only || pick.only.includes(b.name)) && !pick?.except?.includes(b.name))
   return await Promise.all([
-    ...BUILDERS.flatMap((b) => targets.flatMap((t) => bundles.map((txs) => builderCall(b, signer, 'eth_sendBundle', [{ txs, blockNumber: toHex(t), ...(mayRevert?.length ? { revertingTxHashes: mayRevert } : {}) }])))),
+    ...to.flatMap((b) => targets.flatMap((t) => bundles.map((txs) => builderCall(b, signer, 'eth_sendBundle', [{ txs, blockNumber: toHex(t), ...(mayRevert?.length ? { revertingTxHashes: mayRevert } : {}) }])))),
     ...(publicRaw ? PUBLIC_MEMPOOL.map((u) => publicSend(u, publicRaw)) : []),
   ])
 }
@@ -606,7 +610,7 @@ async function probeLiquidity(ctx: Ctx, preceding: Hex[], n: number): Promise<Pr
   return { ok: true, x, exitExpected, exitSkip, availableAfter }
 }
 
-type Leg = { raw: Hex; hash: Hex; expected: bigint; detail: Record<string, unknown> }
+type Leg = { raw: Hex; hash: Hex; expected: bigint; detail: Record<string, unknown>; alt?: { raw: Hex; hash: Hex; tip_usds: string; tip_share: number } }
 type Skip = { skipped: string; [k: string]: unknown }
 const isLeg = (x: Leg | Skip): x is Leg => 'raw' in x
 
@@ -678,10 +682,11 @@ async function directArbLeg(ctx: Ctx, preceding: Hex[], availableWad: bigint, no
       tipShare,
       minNetUsds: Number(cfg.arb_min_net_usd ?? 25),
       minBuyUsds: minOpening / 2,
+      altTipShare: Number(cfg.arb_tip_share_buildernet ?? 0) || undefined,
     })
     if (!r.raw) return { skipped: r.skipped ?? 'no plan', ...r }
-    const { raw, hash, ...rest } = r
-    return { raw, hash, expected: 0n, detail: { hash, nonce, tip_share: tipShare, ...rest } }
+    const { raw, hash, alt, ...rest } = r
+    return { raw, hash, alt, expected: 0n, detail: { hash, nonce, tip_share: tipShare, ...rest, ...(alt ? { buildernet_bid: { hash: alt.hash, tip_usds: alt.tip_usds, tip_share: alt.tip_share } } : {}) } }
   } catch (e) {
     return { skipped: String(e).slice(0, 200) }
   }
@@ -726,7 +731,7 @@ async function watchLanding(ctx: Ctx, seenBlock: number, route: string, exit: Le
  * arb takes what is left. The exit bundle is sent as soon as it is ready; the
  * bundle that also carries the arb follows, and builders take whichever is best.
  */
-async function runRoute(ctx: Ctx, o: { route: 'end of block' | 'Safe route' | 'backrun' | 'test, alone' | 'test, public race'; seenBlock: number; preceding: Hex[]; n: number; extraGas?: bigint; tipShare: number; nTargets: number; publicCopy?: boolean; meta?: Record<string, unknown> }) {
+async function runRoute(ctx: Ctx, o: { route: 'end of block' | 'Safe route' | 'backrun' | 'test, alone' | 'test, public race'; seenBlock: number; preceding: Hex[]; n: number; extraGas?: bigint; tipShare: number; nTargets: number; publicCopy?: boolean; onlyBuilders?: string[]; meta?: Record<string, unknown> }) {
   const t0 = Date.now()
   const cfg = ctx.config
   const keeper = ctx.keeper!
@@ -752,7 +757,7 @@ async function runRoute(ctx: Ctx, o: { route: 'end of block' | 'Safe route' | 'b
   const exclusive = o.route === 'Safe route' || o.route === 'test, alone'
   const holdExit = exclusive && isLeg(exit) && !!(cfg.arb_enabled && cfg.arb2_address) && p.availableAfter >= parseUnits(String(cfg.arb_min_usds ?? 1000), 18)
   const sendExitAlone = async () => {
-    if (isLeg(exit) && !LOCAL_SUBMIT) sent.push(...await sendBundles(keeper, [[...o.preceding, exit.raw]], targets, o.publicCopy && cfg.public_broadcast ? exit.raw : undefined))
+    if (isLeg(exit) && !LOCAL_SUBMIT) sent.push(...await sendBundles(keeper, [[...o.preceding, exit.raw]], targets, o.publicCopy && cfg.public_broadcast ? exit.raw : undefined, undefined, { only: o.onlyBuilders }))
   }
   if (!holdExit) await sendExitAlone()
   const exitMs = Date.now() - t0
@@ -765,14 +770,20 @@ async function runRoute(ctx: Ctx, o: { route: 'end of block' | 'Safe route' | 'b
   const direct: Leg | Skip = holdExit
     ? await Promise.race([directArbLeg(ctx, before, available, arbNonce, o.tipShare), sleep(LOCAL_SUBMIT ? 30_000 : 2500).then((): Skip => ({ skipped: 'arb plan took too long' }))])
     : await directArbLeg(ctx, before, available, arbNonce, o.tipShare)
-  if (isLeg(direct) && !LOCAL_SUBMIT) sent.push(...await sendBundles(keeper, [[...before, direct.raw]], targets, undefined, holdExit ? [direct.hash] : undefined))
+  if (isLeg(direct) && !LOCAL_SUBMIT) {
+    const alt = direct.alt
+    const refunders = REFUNDING.filter((b) => !o.onlyBuilders || o.onlyBuilders.includes(b))
+    // Builders that refund overpayment get the higher bid; everyone else gets the normal one. Same nonce: one lands at most.
+    if (alt && refunders.length) sent.push(...await sendBundles(keeper, [[...before, alt.raw]], targets, undefined, holdExit ? [alt.hash] : undefined, { only: refunders }))
+    sent.push(...await sendBundles(keeper, [[...before, direct.raw]], targets, undefined, holdExit ? [direct.hash] : undefined, { only: o.onlyBuilders, except: alt && refunders.length ? refunders : undefined }))
+  }
   if (holdExit && !isLeg(direct)) await sendExitAlone()
   const directMs = Date.now() - t0
   // The KyberSwap route also reaches resting limit orders, which matters for large openings. It is slower, so it
   // goes out as a second bundle (same nonce: at most one of the two can land) or stands in when the direct one has no plan.
   const wantKyber = kyberOn && (!isLeg(direct) || available >= parseUnits(String(cfg.arb_kyber_min_usds ?? 150000), 18))
   const kyber: Leg | Skip = wantKyber ? await arbLeg(ctx, before, available, arbNonce, o.tipShare, ladder) : { skipped: 'not needed at this size' }
-  if (isLeg(kyber) && !LOCAL_SUBMIT) sent.push(...await sendBundles(keeper, [[...before, kyber.raw]], targets, undefined, holdExit ? [kyber.hash] : undefined))
+  if (isLeg(kyber) && !LOCAL_SUBMIT) sent.push(...await sendBundles(keeper, [[...before, kyber.raw]], targets, undefined, holdExit ? [kyber.hash] : undefined, { only: o.onlyBuilders }))
   // The better-paying of the two is the one a builder would take.
   const tipOf = (l: Leg | Skip) => (isLeg(l) ? Number(l.detail.tip_usds ?? 0) : -1)
   const arb: Leg | Skip = tipOf(kyber) > tipOf(direct) ? kyber : isLeg(direct) ? direct : kyber
@@ -798,7 +809,7 @@ async function runRoute(ctx: Ctx, o: { route: 'end of block' | 'Safe route' | 'b
     return { skipped: 'nothing for us' }
   }
   await log(ctx, o.seenBlock, 'fired', detail)
-  const landed = await watchLanding(ctx, o.seenBlock, o.route, isLeg(exit) ? exit : null, LOCAL_SUBMIT ? (isLeg(arb) ? [arb] : []) : [direct, kyber].filter(isLeg))
+  const landed = await watchLanding(ctx, o.seenBlock, o.route, isLeg(exit) ? exit : null, LOCAL_SUBMIT ? (isLeg(arb) ? [arb] : []) : [direct, kyber, ...(isLeg(direct) && direct.alt ? [{ ...direct, raw: direct.alt.raw, hash: direct.alt.hash, detail: { ...direct.detail, tip_usds: direct.alt.tip_usds, tip_share: direct.alt.tip_share, via: 'higher bid for refunding builders' } } as Leg] : [])].filter(isLeg))
   // Open races teach the bid: after a win offer builders a little less next time, after a loss a little more.
   const contested = o.route === 'backrun' || o.route === 'end of block' || o.route === 'test, public race'
   if (contested && (isLeg(direct) || isLeg(kyber))) {
@@ -1344,8 +1355,10 @@ async function drill(ctx: Ctx, body: any) {
     if (body.mode === 'race' && !LOCAL_SUBMIT) await Promise.all(PUBLIC_MEMPOOL.map((u) => publicSend(u, dep.raw)))
     const out = await runRoute(ctx, {
       route: body.mode === 'race' ? 'test, public race' : 'test, alone', seenBlock: Number(head.number), preceding: [dep.raw], n: n + 1,
-      tipShare: Number(body.mode === 'race' ? cfg.arb_tip_share_race ?? 0.99 : cfg.arb_tip_share_safe ?? 0.3), nTargets: 3,
-      meta: { test_deposit: dep.hash, test_usds: body.usds },
+      tipShare: Number(body.tip_share ?? (body.mode === 'race' ? cfg.arb_tip_share_race ?? 0.99 : cfg.arb_tip_share_safe ?? 0.3)),
+      nTargets: Math.min(Math.max(Number(body.targets ?? 3), 1), 12),
+      onlyBuilders: Array.isArray(body.builders) && body.builders.length ? body.builders.map(String) : undefined,
+      meta: { test_deposit: dep.hash, test_usds: body.usds, ...(body.builders ? { builders_only: body.builders } : {}) },
     })
     return { mode: body.mode, deposit_tx: dep.hash, ...out }
   }
