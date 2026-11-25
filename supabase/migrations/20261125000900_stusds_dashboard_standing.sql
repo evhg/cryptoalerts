@@ -1,0 +1,27 @@
+-- Dashboard: standing bundles, number of pending-transaction feeds, BuilderNet bid.
+create or replace view stusds_alert.v_dash_now with (security_invoker = true) as
+select to_char(n.at at time zone 'Asia/Bangkok', 'DD Mon HH24:MI:SS') as updated_bkk,
+  round(extract(epoch from now() - n.at)) as age_s,
+  n.data - 'loans' - 'dex_ladder' - 'safes' - 'clip' as d,
+  to_char((n.data->>'rates_next_change')::timestamptz at time zone 'Asia/Bangkok', 'DD Mon HH24:MI') as rates_next_bkk,
+  ((n.data->>'rates_next_change')::timestamptz <= now()) as rates_change_due,
+  round((n.data->>'main_value')::numeric * (n.data->>'fee_bps')::numeric / 10000 / (n.data->>'eth_usd')::numeric, 3) as tip_cap_eth,
+  round((n.data->>'main_value')::numeric * (n.data->>'fee_bps')::numeric / 10000) as tip_cap_usd,
+  (select round(extract(epoch from now() - max(h.at))) from stusds_alert.heartbeats h where h.kind = 'mempool') as mempool_age_s,
+  coalesce((select greatest((select max(last_ok_at) from stusds_alert.safe_poll_state), (select max(updated_at) from stusds_alert.safe_txs)) > now() - interval '30 minutes'), false) as safe_ok,
+  (select count(*) from stusds_alert.safe_txs s where s.executed_at is null and s.repay_usds > 0) as safe_queued,
+  (select coalesce(round(sum(s.repay_usds)), 0) from stusds_alert.safe_txs s where s.executed_at is null and s.repay_usds > 0) as safe_queued_usds,
+  (select coalesce(round(sum(e.amount)), 0) from stusds_alert.chain_events e where e.kind = 'Wipe' and e.block_ts > now() - interval '24 hours') as repaid_24h,
+  (select count(*) from stusds_alert.chain_events e where e.kind = 'Wipe' and e.amount >= 1000 and e.block_ts > now() - interval '24 hours') as repayments_24h,
+  (select count(distinct t.entity) from stusds_alert.takers t where t.kind = 'arb' and t.block_ts > now() - interval '7 days') as arb_bots_7d,
+  (select count(distinct t.entity) from stusds_alert.takers t where t.kind = 'arb') as arb_bots_all,
+  (select count(distinct t.entity) from stusds_alert.takers t where t.kind = 'holder') as holders_all,
+  (select to_char(min(t.block_ts) at time zone 'Asia/Bangkok', 'DD Mon') from stusds_alert.takers t) as takers_since,
+  (select round(100 * sum(t.pay_eth) * (n.data->>'eth_usd')::numeric / nullif(sum(t.amount), 0), 1) from stusds_alert.takers t where t.kind = 'arb' and t.traced and t.block_ts > now() - interval '3 days') as arb_pay_pct_3d,
+  (select round(100 * e.arb_tip_share_race, 1) from stusds_alert.exit_config e where e.id = 1) as arb_tip_share_race_pct,
+  (select round(extract(epoch from now() - h.at)) from stusds_alert.heartbeats h where h.kind = 'standing') as standing_age_s,
+  (select coalesce((h.detail->>'blocks')::int, 0) from stusds_alert.heartbeats h where h.kind = 'standing') as standing_blocks,
+  (select coalesce((h.detail->>'arb')::boolean, false) from stusds_alert.heartbeats h where h.kind = 'standing') as standing_arb_on,
+  (select count(*) from stusds_alert.heartbeats h, jsonb_object_keys(coalesce(h.detail->'first_seen_by', '{}'::jsonb)) k where h.kind = 'mempool') as pending_feeds,
+  (select round(100 * e.arb_tip_share_buildernet, 1) from stusds_alert.exit_config e where e.id = 1) as arb_tip_share_buildernet_pct
+from stusds_alert.dash_now n where n.id = 1;
