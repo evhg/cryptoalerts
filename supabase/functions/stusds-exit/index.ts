@@ -1415,7 +1415,12 @@ async function approveTest(ctx: Ctx) {
 
 /** Create liquidity on purpose (a drill): the keeper deposits USDS into stUSDS. */
 async function drill(ctx: Ctx, body: any) {
-  const k = ctx.keeper!
+  // `from: "test"` deposits from the test wallet instead of the bot key. A deposit from another account is what the
+  // standing bundles are for: they use the bot key's current nonce and so cannot follow one of its own transactions.
+  const fromTest = body.from === 'test' && !!ctx.testOwner
+  if (fromTest && body.mode) return { error: 'a deposit from the test wallet cannot travel in the bot key\'s bundle' }
+  const k = fromTest ? ctx.testOwner! : ctx.keeper!
+  if (fromTest) await ensureGas(ctx, k.address, 700_000n)
   const amount = parseUnits(String(body.usds), 18)
   const allowance = await client.readContract({ address: USDS, abi: tokenAbi, functionName: 'allowance', args: [k.address, ST_USDS] })
   if (allowance < amount) {
@@ -1442,8 +1447,8 @@ async function drill(ctx: Ctx, body: any) {
   // A public deposit is backrun in the same block by mempool bots; a private one
   // only becomes visible once its block is out, which is the race the exit bot runs.
   const r = body.private ? (await sendPrivate(k, req, 2)).receipt : await sendPublic(k, req)
-  await log(ctx, r.blockNumber, 'drill_deposit', { usds: body.usds, private: !!body.private, tx: r.transactionHash, index: r.transactionIndex })
-  return { deposited_usds: body.usds, private: !!body.private, block: r.blockNumber, index: r.transactionIndex, tx: r.transactionHash }
+  await log(ctx, r.blockNumber, 'drill_deposit', { usds: body.usds, private: !!body.private, from: fromTest ? 'test wallet' : 'bot key', tx: r.transactionHash, index: r.transactionIndex })
+  return { deposited_usds: body.usds, private: !!body.private, from: fromTest ? 'test wallet' : 'bot key', block: r.blockNumber, index: r.transactionIndex, tx: r.transactionHash }
 }
 
 /** Return test funds to the main wallet. The destination is fixed. */
