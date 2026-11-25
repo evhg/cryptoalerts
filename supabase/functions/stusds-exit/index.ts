@@ -286,12 +286,21 @@ async function sendPublic(account: PrivateKeyAccount, req: TxReq) {
   return receipt
 }
 
+const sigCache = new Map<string, string>()
 async function builderCall(b: (typeof BUILDERS)[number], signer: PrivateKeyAccount, method: string, params: unknown[], fullBody = false) {
   const body = JSON.stringify({ jsonrpc: '2.0', id: 1, method, params })
   const headers: Record<string, string> = { 'content-type': 'application/json' }
   if (b.sign) {
-    // Flashbots-style: EIP-191 signature over the hex string of keccak256(body).
-    headers['X-Flashbots-Signature'] = `${signer.address}:${await signer.signMessage({ message: keccak256(stringToBytes(body)) })}`
+    // Flashbots-style: EIP-191 signature over the hex string of keccak256(body). The same body goes to several
+    // builders, so it is signed once.
+    const key = `${signer.address}:${keccak256(stringToBytes(body))}`
+    let sig = sigCache.get(key)
+    if (!sig) {
+      sig = await signer.signMessage({ message: keccak256(stringToBytes(body)) })
+      if (sigCache.size > 400) sigCache.clear()
+      sigCache.set(key, sig)
+    }
+    headers['X-Flashbots-Signature'] = `${signer.address}:${sig}`
   }
   const started = Date.now()
   try {
@@ -990,6 +999,83 @@ async function tick(ctx: Ctx) {
 // exit and the arb directly behind them, as one bundle that only lands if the
 // repayment does, in the same block.
 
+// ---------- standing withdrawal ----------
+
+/**
+ * A withdrawal that waits inside every block.
+ *
+ * Liquidity can appear in the middle of a block from a transaction nobody saw coming (a repayment sent privately to
+ * a builder). Other bots catch that by submitting, for every block, a transaction that takes whatever is
+ * withdrawable at the moment it runs. This does the same for the owner's withdrawal: each block the builders get a
+ * small set of withdrawal bundles that are only valid if USDS is withdrawable when they run. A bundle that is not
+ * valid is not included and costs nothing.
+ *
+ * The amount is not known when the bundle is signed, and the fee may never exceed the fee policy. So there is one
+ * bundle per size class: each withdraws everything Sky can pay, but only counts if that is at least its class's
+ * minimum, and carries the tip the fee policy allows for that minimum. All use the same nonce, so one at most lands;
+ * a builder takes the best-paying class that fits.
+ */
+const STANDING_GAS = 500_000n
+async function standingTiers(ctx: Ctx, n: number) {
+  const cfg = ctx.config
+  const keeper = ctx.keeper!
+  const { helper, owner } = await verifyHelper(ctx)
+  const [shares, allowance, balance] = await Promise.all([
+    client.readContract({ address: ST_USDS, abi: tokenAbi, functionName: 'balanceOf', args: [owner] }),
+    client.readContract({ address: ST_USDS, abi: tokenAbi, functionName: 'allowance', args: [owner, helper] }),
+    client.getBalance({ address: keeper.address }),
+  ])
+  const usable = shares < allowance ? shares : allowance
+  if (usable === 0n) return null // nothing to withdraw, or the approval is not signed
+  const value = await client.readContract({ address: ST_USDS, abi: tokenAbi, functionName: 'convertToAssets', args: [usable] })
+  const base = parseUnits(String(Math.max(Number(cfg.min_assets_usds ?? 0), 1)), 18)
+  const mins: bigint[] = []
+  for (let a = (value * 998n) / 1000n; a >= parseUnits('5000', 18) && mins.length < 8; a /= 2n) mins.push(a)
+  if (value > base) mins.push(base)
+  const prio = Number(cfg.priority_gwei ?? 1)
+  const tiers: { raw: Hex; hash: Hex; min_usds: string; tip_eth: string }[] = []
+  for (const min of mins) {
+    const plan = await feePlan(cfg, min, EXIT_GAS_USED, balance, STANDING_GAS)
+    if (!plan.ok) continue
+    const data = encodeFunctionData({ abi: exitAbi, functionName: 'exit', args: [maxUint256, min] })
+    const signed = await signTx(keeper, { to: helper, data, value: plan.tipWei, gas: STANDING_GAS }, prio, n)
+    tiers.push({ raw: signed.raw, hash: signed.hash, min_usds: formatUnits(min, 18), tip_eth: formatEther(plan.tipWei) })
+  }
+  return { owner, position_usds: formatUnits(value, 18), tiers }
+}
+
+/** Runs beside the pending-transaction watch: for every new block, put the standing bundles in front of the builders. */
+async function standingLoop(ctx: Ctx, deadline: number) {
+  const cfg = ctx.config
+  if (!cfg.enabled || cfg.standing_exit === false || !ctx.keeper || LOCAL_SUBMIT) return
+  let last = 0n
+  const stats = { blocks: 0, bundles: 0, accepted: 0, idle_blocks: 0, position_usds: '0' }
+  while (Date.now() < deadline - 2000) {
+    try {
+      const head = await getHead()
+      if (head.number > last) {
+        last = head.number
+        if (await claim(ctx, `standing:${head.number}`)) {
+          const n = await client.getTransactionCount({ address: ctx.keeper.address, blockTag: 'latest' })
+          const t = await standingTiers(ctx, n)
+          if (!t || !t.tiers.length) stats.idle_blocks++
+          else {
+            const res = await sendBundles(ctx.keeper, t.tiers.map((x) => [x.raw]), [head.number + 1n])
+            stats.blocks++
+            stats.bundles += t.tiers.length
+            stats.accepted += res.filter((r: any) => r.status === 200).length
+            stats.position_usds = t.position_usds
+          }
+        }
+      }
+    } catch (e) {
+      console.error('standing bundle', String(e).slice(0, 160))
+    }
+    await sleep(700)
+  }
+  await db('stusds_exit_heartbeat', { p_secret: ctx.secret, p_kind: 'standing', p_detail: stats }).catch(() => null)
+}
+
 // Two independent feeds: each node only sees part of the public queue (on 25 Nov one showed well under half of what the other did).
 const PENDING_WS = ['wss://ethereum-rpc.publicnode.com', 'wss://0xrpc.io/eth']
 // Optional third feed: an Alchemy key in the function's secrets (any name containing "alchemy"; a bare key or a full
@@ -1070,6 +1156,7 @@ async function mempoolWatch(ctx: Ctx) {
       if (!closed) setTimeout(() => connect(url, params), 1500)
     }
   }
+  const standing = standingLoop(ctx, deadline).catch((e) => console.error('standing loop failed', String(e).slice(0, 160)))
   PENDING_WS.forEach((u) => connect(u))
   const alchemy = alchemyKey()
   if (alchemy) {
@@ -1082,6 +1169,7 @@ async function mempoolWatch(ctx: Ctx) {
     try { ws.close() } catch { /* closed */ }
   }
   await busy
+  await standing
   // Heartbeat for the dashboard: the pending feed is alive and this many transactions went past.
   await db('stusds_exit_heartbeat', { p_secret: ctx.secret, p_kind: 'mempool', p_detail: { seen: seen.size, candidates, first_seen_by: firstFrom } }).catch(() => null)
   console.log(`mempool run done: ${seen.size} pending transactions seen, ${candidates} candidates`)
@@ -1348,6 +1436,12 @@ Deno.serve(async (req) => {
         return json(await deployArb(ctx))
       case 'deploy_arb2':
         return json(await deployArb2(ctx))
+      case 'standing_once': {
+        // Fork rehearsals only: hand back the standing bundles for the next block.
+        if (!LOCAL_SUBMIT) return json({ error: 'unknown action' }, 400)
+        const n = await client.getTransactionCount({ address: ctx.keeper!.address, blockTag: 'latest' })
+        return json(await standingTiers(ctx, n))
+      }
       case 'simcheck':
         return json(await simcheck(ctx))
       case 'backrun_test': {

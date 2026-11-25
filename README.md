@@ -129,6 +129,8 @@ The arb goes out in up to two bundles: the direct one (`arb2.ts`, sized with exa
 
 On routes where the opening only exists inside the bot's own bundle (a Safe repayment it executes, a private test deposit), the withdrawal and the arb travel as one bundle, with the arb marked as allowed to fail. Sent separately, a builder can pair the withdrawal with someone else's arb: several bots submit a transaction every block that simply takes whatever is withdrawable when it runs, which is how the first live test on 25 Nov lost its arb.
 
+Besides reacting to what it sees, the bot keeps a standing withdrawal in front of the builders for every block (`standingLoop`): a small set of withdrawal bundles that are only valid if USDS is withdrawable at the moment they run, so liquidity freed mid-block by a transaction nobody saw is caught in that same block. There is one bundle per size class (the full position, then halves down to about 10,000 USDS, then a base class); each withdraws everything Sky can pay, counts only if that is at least its class minimum, and carries the tip the fee policy allows for that minimum, so the fee never exceeds the policy. They share a nonce, so at most one lands, and a bundle that is not valid costs nothing. Switch: `standing_exit`.
+
 The pending-transaction watch listens to two public feeds and, when an Alchemy key is present in the function's secrets (any name containing "alchemy"), to Alchemy's filtered feed as a third.
 
 `drill` with `mode: "alone"` or `mode: "race"` runs a live test: the bot key deposits USDS into stUSDS inside the bot's own bundle (alone) or also publicly (race), and the usual withdrawal and arb follow.
