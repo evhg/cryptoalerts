@@ -1,0 +1,451 @@
+<meta name="dash-one-writer">
+<meta name="dash-form" content="dashboard">
+<style>
+  .sx { display: grid; gap: var(--cds-gap-xl); font-family: var(--font-anthropic-sans); color: var(--color-fg); font-variant-numeric: tabular-nums; }
+  .sx-eyebrow { margin: 0 0 var(--cds-gap-xs); font-size: var(--cds-font-size-caption); letter-spacing: .08em; text-transform: uppercase; color: var(--color-fg-muted); }
+  .sx-title { margin: 0; font-family: var(--font-anthropic-serif); font-weight: 400; font-size: clamp(28px, 4.2vw, 44px); line-height: 1.05; }
+  .sx-lede { margin: var(--cds-gap-md) 0 0; max-width: 68ch; font-size: var(--cds-font-size-heading); line-height: 1.45; }
+  .sx-lede b, .sx-note b { font-weight: var(--cds-font-weight-medium); }
+  .sx-stamp { margin: var(--cds-gap-sm) 0 0; font-size: var(--cds-font-size-caption); color: var(--color-fg-muted); }
+  .sx-live { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--color-ok); margin-right: 6px; vertical-align: 1px; }
+  .sx-live.is-stale { background: var(--color-bad); }
+  @media (prefers-reduced-motion: no-preference) { .sx-live:not(.is-stale) { animation: sx-pulse 2.4s var(--cds-ease-out) infinite; } }
+  @keyframes sx-pulse { 0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--color-ok) 55%, transparent); } 70%, 100% { box-shadow: 0 0 0 8px transparent; } }
+
+  .sx-hero { display: grid; gap: var(--cds-gap-md); grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr)); }
+  .sx-card { background: var(--color-panel); border: 1px solid var(--color-border-line); border-radius: var(--cds-radius); padding: var(--cds-pad-lg); min-width: 0; }
+  .sx-card h3, .sx-k { margin: 0; font-size: var(--cds-font-size-caption); font-weight: var(--cds-font-weight-medium); color: var(--color-fg-muted); letter-spacing: .02em; }
+  .sx-big { margin: var(--cds-gap-sm) 0 0; font-family: var(--font-anthropic-serif); font-weight: 400; font-size: clamp(34px, 5.4vw, 56px); line-height: 1; white-space: nowrap; }
+  .sx-big small { font-family: var(--font-anthropic-sans); font-size: var(--cds-font-size-body); color: var(--color-fg-muted); margin-left: 6px; }
+  .sx-num { margin: var(--cds-gap-sm) 0 0; font-family: var(--font-anthropic-serif); font-weight: 400; font-size: var(--cds-font-size-title); line-height: 1.1; white-space: nowrap; }
+  .sx-num small { font-family: var(--font-anthropic-sans); font-size: var(--cds-font-size-caption); color: var(--color-fg-muted); margin-left: 4px; }
+  .sx-sub { margin: var(--cds-gap-sm) 0 0; font-size: var(--cds-font-size-caption); color: var(--color-fg-muted); line-height: 1.45; }
+  .sx-sub b { color: var(--color-fg); font-weight: var(--cds-font-weight-medium); }
+  .sx-meter { margin-top: var(--cds-gap-md); height: 8px; border-radius: 4px; background: var(--color-border-line); overflow: hidden; }
+  .sx-meter i { display: block; height: 100%; width: 0; border-radius: 4px; background: var(--color-bad); }
+  .sx-meter i.is-open { background: var(--color-ok); }
+  .sx-stats { display: grid; gap: var(--cds-gap-md); grid-template-columns: repeat(auto-fit, minmax(min(100%, 190px), 1fr)); }
+
+  .sx-sec { display: grid; gap: var(--cds-gap-md); min-width: 0; }
+  .sx-h2 { margin: 0; font-family: var(--font-anthropic-serif); font-weight: 400; font-size: var(--cds-font-size-title); }
+  .sx-note { margin: 0; max-width: 78ch; color: var(--color-fg-muted); line-height: 1.5; }
+  .sx-note b { color: var(--color-fg); }
+  .sx-two { display: grid; gap: var(--cds-gap-md); grid-template-columns: repeat(auto-fit, minmax(min(100%, 340px), 1fr)); }
+
+  .sx-checks { list-style: none; margin: 0; padding: 0; display: grid; }
+  .sx-checks li { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: var(--cds-gap-xs) var(--cds-gap-md); align-items: start; padding: var(--cds-pad-sm) 0; border-top: 1px solid var(--color-border-line); }
+  .sx-checks li:first-child { border-top: 0; padding-top: 0; }
+  .sx-checks strong { font-weight: var(--cds-font-weight-medium); }
+  .sx-checks p { margin: 2px 0 0; font-size: var(--cds-font-size-caption); color: var(--color-fg-muted); line-height: 1.45; }
+  .sx-checks p b { color: var(--color-fg); font-weight: var(--cds-font-weight-medium); }
+  .sx-chip { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px 3px 8px; border-radius: 999px; border: 1px solid var(--color-border-line); font-size: var(--cds-font-size-caption); white-space: nowrap; }
+  .sx-chip i { font-style: normal; font-weight: 700; }
+  .sx-chip.is-ok i { color: var(--color-ok); } .sx-chip.is-warn i { color: var(--color-warn); } .sx-chip.is-bad i { color: var(--color-bad); }
+  .sx-chip.is-bad { border-color: var(--color-bad); }
+
+  .sx-chart { position: relative; min-height: 200px; margin-top: var(--cds-gap-sm); }
+  .sx-chart svg { display: block; overflow: visible; }
+  .sx-chart text { fill: var(--cds-text-secondary); font-size: var(--cds-font-size-caption); font-family: var(--font-anthropic-sans); }
+  .sx-chart .sx-val { fill: var(--color-fg); }
+  .sx-empty { margin: 0; padding: 70px 0; text-align: center; color: var(--color-fg-muted); font-size: var(--cds-font-size-caption); }
+  .sx-tip { position: absolute; z-index: 2; pointer-events: none; background: var(--cds-surface-popover); border: 1px solid var(--cds-border); box-shadow: var(--cds-shadow-popover); border-radius: 6px; padding: 6px 9px; font-size: var(--cds-font-size-caption); line-height: 1.5; white-space: nowrap; }
+  .sx-tip em { font-style: normal; color: var(--cds-text-secondary); }
+  .sx-legend { display: flex; flex-wrap: wrap; gap: var(--cds-gap-md); margin: var(--cds-gap-sm) 0 0; padding: 0; list-style: none; font-size: var(--cds-font-size-caption); color: var(--color-fg-muted); }
+  .sx-legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 6px; }
+
+  .sx-scroll { overflow-x: auto; margin-top: var(--cds-gap-sm); }
+  .sx-table { width: 100%; border-collapse: collapse; font-size: var(--cds-font-size-caption); }
+  .sx-table th { text-align: left; font-weight: var(--cds-font-weight-medium); color: var(--color-fg-muted); padding: 6px 12px 6px 0; border-bottom: 1px solid var(--color-border-line); white-space: nowrap; }
+  .sx-table td { padding: 7px 12px 7px 0; border-bottom: 1px solid var(--color-border-line); vertical-align: top; }
+  .sx-table tr:last-child td { border-bottom: 0; }
+  .sx-table .r { text-align: right; white-space: nowrap; }
+  .sx-table .nw { white-space: nowrap; }
+  .sx-table a { color: inherit; text-decoration: underline; text-decoration-color: var(--color-border-line); text-underline-offset: 3px; }
+  .sx-table .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+  .sx-table .dim { color: var(--color-fg-muted); }
+  .sx-tag { display: inline-block; padding: 1px 7px; border-radius: 999px; border: 1px solid var(--color-border-line); white-space: nowrap; }
+  .sx-tag.is-bad { border-color: var(--color-bad); } .sx-tag.is-ok { border-color: var(--color-ok); }
+  .sx-foot { margin: 0; font-size: var(--cds-font-size-caption); color: var(--color-fg-muted); line-height: 1.5; max-width: 90ch; }
+  @media print { .sx-sec { break-before: auto; } .sx-scroll { overflow: visible; } }
+</style>
+
+<div class="sx">
+  <header id="top">
+    <p class="sx-eyebrow">Sky &middot; stUSDS vault &middot; Ethereum</p>
+    <h1 class="sx-title" id="title">stUSDS exit watch</h1>
+    <p class="sx-lede" id="takeaway-locked">Nothing can be withdrawn right now: all <b class="dash-skeleton" data-draw="v" data-fmt="short" data-source="now" data-field="total_assets" data-row="0">—</b> USDS in stUSDS is lent out. stUSDS sells on exchanges <b class="dash-skeleton" data-draw="v" data-fmt="pct1" data-source="now" data-field="dex_discount_pct" data-row="0">—</b> below its value, and borrowers repaid <b class="dash-skeleton" data-draw="v" data-fmt="int" data-source="now" data-field="repaid_24h" data-row="0">—</b> USDS in the last 24 hours.</p>
+    <p class="sx-lede" id="takeaway-open" hidden><b data-draw="v" data-fmt="int" data-source="now" data-field="available" data-row="0">—</b> USDS can be withdrawn right now. Openings like this are usually taken within one block, so whatever the bot can do it is already doing.</p>
+    <p class="sx-lede" id="takeaway-unarmed">Your main wallet is not protected yet: its approval is unsigned, so the bot can only move the <b class="dash-skeleton" data-draw="v" data-fmt="usd2" data-source="now" data-field="test_value" data-row="0">—</b> USDS test position.</p>
+    <p class="sx-lede" id="takeaway-armed" hidden>Your main wallet is armed: the bot withdraws up to <b data-draw="v" data-fmt="int" data-source="now" data-field="main_value" data-row="0">—</b> USDS the moment it is freed.</p>
+    <p class="sx-stamp"><span class="sx-live" id="live-dot"></span>Snapshot taken <span data-draw="v" data-fmt="text" data-source="now" data-field="updated_bkk" data-row="0">—</span> Bangkok time, block <span data-draw="v" data-fmt="plain" data-source="now" data-field="block" data-row="0">—</span>. A new one is taken every minute and this page reloads it while it is open.</p>
+  </header>
+
+  <section class="sx-hero" id="headline">
+    <div class="sx-card" id="card-available">
+      <h3>Withdrawable right now</h3>
+      <p class="sx-big"><span class="dash-skeleton" data-draw="v" data-fmt="int" data-source="now" data-field="available" data-row="0">—</span><small>USDS</small></p>
+      <div class="sx-meter" data-draw="meter" data-source="now" data-field="util_pct" data-row="0"></div>
+      <p class="sx-sub"><b data-draw="v" data-fmt="pct3" data-source="now" data-field="util_pct" data-row="0">—</b> of deposits are lent out (<b data-draw="v" data-fmt="short" data-source="now" data-field="debt" data-row="0">—</b> of <b data-draw="v" data-fmt="short" data-source="now" data-field="total_assets" data-row="0">—</b> USDS). Withdrawals only work for the part that is not lent out.</p>
+    </div>
+    <div class="sx-card" id="card-position">
+      <h3>Your stUSDS position</h3>
+      <p class="sx-big"><span class="dash-skeleton" data-draw="v" data-fmt="int" data-source="now" data-field="main_value" data-row="0">—</span><small>USDS</small></p>
+      <p class="sx-sub">Growing by about <b data-draw="v" data-fmt="int" data-source="now" data-field="main_daily_yield" data-row="0">—</b> USDS a day at the current <b data-draw="v" data-fmt="pct0" data-source="now" data-field="str_pct" data-row="0">—</b> yearly rate. One stUSDS is worth <b data-draw="v" data-fmt="px4" data-source="now" data-field="nav" data-row="0">—</b> USDS when redeemed and sells for <b data-draw="v" data-fmt="px4" data-source="now" data-field="dex_price" data-row="0">—</b> on exchanges.</p>
+      <p class="sx-sub">Main wallet also holds <b data-draw="v" data-fmt="usd2" data-source="now" data-field="main_usds" data-row="0">—</b> USDS and <b data-draw="v" data-fmt="eth3" data-source="now" data-field="main_eth" data-row="0">—</b> ETH.</p>
+    </div>
+  </section>
+
+  <section class="sx-stats" id="stats">
+    <div class="sx-card" id="card-discount"><h3>Discount on exchanges</h3><p class="sx-num"><span class="dash-skeleton" data-draw="v" data-fmt="pct1" data-source="now" data-field="dex_discount_pct" data-row="0">—</span></p><p class="sx-sub">How far below its redeemable value stUSDS sells, for a 5,000 USDS purchase.</p></div>
+    <div class="sx-card" id="card-arb"><h3>Arb profit on offer</h3><p class="sx-num"><span class="dash-skeleton" data-draw="v" data-fmt="int" data-source="now" data-field="arb_profit_750k" data-row="0">—</span><small>USDS</small></p><p class="sx-sub">Before tips, if 750,000 USDS were freed and nobody else took it. <b data-draw="v" data-fmt="int" data-source="now" data-field="arb_profit_150k" data-row="0">—</b> for 150,000.</p></div>
+    <div class="sx-card" id="card-repaid"><h3>Repaid in 24 hours</h3><p class="sx-num"><span class="dash-skeleton" data-draw="v" data-fmt="int" data-source="now" data-field="repaid_24h" data-row="0">—</span><small>USDS</small></p><p class="sx-sub">In <b data-draw="v" data-fmt="plain" data-source="now" data-field="repayments_24h" data-row="0">—</b> repayments of 1,000 USDS or more.</p></div>
+    <div class="sx-card" id="card-sky"><h3>SKY price</h3><p class="sx-num"><span class="dash-skeleton" data-draw="v" data-fmt="usd4" data-source="now" data-field="sky_usd" data-row="0">—</span></p><p class="sx-sub">Loans are valued at no more than <b data-draw="v" data-fmt="usd4" data-source="now" data-field="sky_loan_price" data-row="0">—</b> per SKY.</p></div>
+    <div class="sx-card" id="card-rates"><h3>Rates</h3><p class="sx-num"><span class="dash-skeleton" data-draw="v" data-fmt="pct0" data-source="now" data-field="duty_pct" data-row="0">—</span><small>borrow</small></p><p class="sx-sub">Charged to SKY borrowers per year; stUSDS holders get <b data-draw="v" data-fmt="pct0" data-source="now" data-field="str_pct" data-row="0">—</b>. <span id="rates-due">The rate setter may move them again at any time.</span><span id="rates-wait" hidden>The rate setter may move them again after <b data-draw="v" data-fmt="text" data-source="now" data-field="rates_next_bkk" data-row="0">—</b>.</span></p></div>
+  </section>
+
+  <section class="sx-sec" id="bot">
+    <h2 class="sx-h2">Is the bot ready?</h2>
+    <div class="sx-card">
+      <ul class="sx-checks">
+        <li id="check-bot"><div><strong>Withdrawal bot</strong><p>Looks for withdrawable USDS at every block and acts within about two seconds.</p></div><span class="sx-chip dash-skeleton" data-draw="st" data-check="bot" data-source="now" data-field="bot_enabled" data-row="0">—</span></li>
+        <li id="check-target"><div><strong>Which wallet it protects</strong><p>The bot can only redeem for the wallet that approved its helper contract, and the USDS can only go back to that same wallet.</p></div><span class="sx-chip dash-skeleton" data-draw="st" data-check="target" data-source="now" data-field="bot_target" data-row="0">—</span></li>
+        <li id="check-approval"><div><strong>Main wallet approval</strong><p>Your signature on stUSDS for helper 0xbF54&hellip;5897. Until it is signed, the <b data-draw="v" data-fmt="int" data-source="now" data-field="main_value" data-row="0">—</b> USDS position is not covered.</p></div><span class="sx-chip dash-skeleton" data-draw="st" data-check="approval" data-source="now" data-field="main_allowance" data-row="0">—</span></li>
+        <li id="check-key"><div><strong>Bot key balance</strong><p>Holds <b data-draw="v" data-fmt="eth3" data-source="now" data-field="keeper_eth" data-row="0">—</b> ETH for gas and builder tips. A full exit may tip up to <b data-draw="v" data-fmt="eth3" data-source="now" data-field="tip_cap_eth" data-row="0">—</b> ETH (<b data-draw="v" data-fmt="int" data-source="now" data-field="tip_cap_usd" data-row="0">—</b> USD).</p></div><span class="sx-chip dash-skeleton" data-draw="st" data-check="key" data-source="now" data-field="keeper_eth" data-row="0">—</span></li>
+        <li id="check-safe"><div><strong>Borrower Safe queues</strong><p>Shows large repayments while they still wait for signatures, the one route where nobody competes. <b data-draw="v" data-fmt="plain" data-source="now" data-field="safe_queued" data-row="0">—</b> repayments queued now.</p></div><span class="sx-chip dash-skeleton" data-draw="st" data-check="safe" data-source="now" data-field="safe_ok" data-row="0">—</span></li>
+        <li id="check-mempool"><div><strong>Pending-transaction watch</strong><p>Spots public repayments before they land and bids to follow them in the same block.</p></div><span class="sx-chip dash-skeleton" data-draw="st" data-check="mempool" data-source="now" data-field="mempool_age_s" data-row="0">—</span></li>
+        <li id="check-arb"><div><strong>Arb after the exit</strong><p>When liquidity is left over, buys discounted stUSDS with a flash loan, redeems it and sends the profit to the main wallet.</p></div><span class="sx-chip dash-skeleton" data-draw="st" data-check="arb" data-source="now" data-field="arb_enabled" data-row="0">—</span></li>
+        <li id="check-liq"><div><strong>Liquidations of SKY loans</strong><p>A Sky governance switch, outside our control. While it is off, under-collateralised loans are not sold off.</p></div><span class="sx-chip dash-skeleton" data-draw="st" data-check="liq" data-source="now" data-field="liquidations_stopped" data-row="0">—</span></li>
+      </ul>
+    </div>
+  </section>
+
+  <section class="sx-sec" id="market">
+    <h2 class="sx-h2">Price signals</h2>
+    <div class="sx-two">
+      <div class="sx-card" id="chart-discount-card"><h3>Discount of stUSDS on exchanges, % (Bangkok time)</h3><div class="sx-chart" data-draw="chart-discount" data-source="history"></div></div>
+      <div class="sx-card" id="chart-sky-card"><h3>SKY price in USD against the price loans are valued at (Bangkok time)</h3><div class="sx-chart" data-draw="chart-sky" data-source="history now"></div></div>
+    </div>
+    <p class="sx-foot">These two charts start on 25 Nov, when this page's collector was switched on, and keep the last three days.</p>
+  </section>
+
+  <section class="sx-sec" id="borrowers">
+    <h2 class="sx-h2">Who has to repay</h2>
+    <p class="sx-note">Liquidity only returns when these borrowers repay or new deposits arrive. Cover is the market value of the staked SKY against the debt; a loan falls under the 120% line when SKY, at the price loans are valued at, drops below the price in the last column.</p>
+    <div class="sx-card"><div class="sx-scroll">
+      <table class="sx-table" data-source="loans" data-row-key="urn">
+        <thead><tr><th data-field="owner">Borrower</th><th class="r" data-field="debt">Debt, USDS</th><th class="r" data-field="share_pct">Share of all debt</th><th class="r" data-field="sky">SKY staked</th><th class="r" data-field="cover_pct">Cover</th><th class="r" data-field="liq_price">Under the line below</th><th data-field="state">State</th></tr></thead>
+        <tbody data-draw="rows" data-table="loans"></tbody>
+      </table>
+    </div></div>
+  </section>
+
+  <section class="sx-sec" id="competition">
+    <h2 class="sx-h2">Who else is waiting for the same liquidity</h2>
+    <p class="sx-note"><b data-draw="v" data-fmt="plain" data-source="now" data-field="arb_bots_all" data-row="0">—</b> different arb bots and <b data-draw="v" data-fmt="plain" data-source="now" data-field="holders_all" data-row="0">—</b> holders racing to exit have taken freed liquidity since <b data-draw="v" data-fmt="text" data-source="now" data-field="takers_since" data-row="0">—</b>; <b data-draw="v" data-fmt="plain" data-source="now" data-field="arb_bots_7d" data-row="0">—</b> of the arb bots were active in the last seven days. Over the last three days winning arb bots handed <b data-draw="v" data-fmt="pct1" data-source="now" data-field="arb_pay_pct_3d" data-row="0">—</b> of what they took to block builders. Only winners show up on-chain, so the real number of bots is higher.</p>
+    <div class="sx-two">
+      <div class="sx-card" id="chart-bots-card"><h3>Arb bots that won liquidity, per day</h3>
+        <ul class="sx-legend"><li><i data-swatch="1"></i>First seen that day</li><li><i data-swatch="0"></i>Seen before</li></ul>
+        <div class="sx-chart" data-draw="chart-bots" data-source="daily"></div></div>
+      <div class="sx-card" id="chart-pay-card"><h3>What winning arb bots paid block builders, % of the USDS they took</h3><div class="sx-chart" data-draw="chart-pay" data-source="daily"></div></div>
+    </div>
+    <div class="sx-card" id="rivals-card"><h3>Every address that took freed liquidity, largest first</h3><div class="sx-scroll">
+      <table class="sx-table" data-source="rivals" data-row-key="entity,kind">
+        <thead><tr><th data-field="entity">Address</th><th data-field="kind">What it is</th><th class="r" data-field="takes">Times</th><th class="r" data-field="usds">USDS taken</th><th class="r" data-field="pay_pct">Paid to builders</th><th class="r" data-field="best_lag">Fastest, blocks behind</th><th data-field="first_bkk">First seen</th><th data-field="last_bkk">Last seen</th></tr></thead>
+        <tbody data-draw="rows" data-table="rivals"></tbody>
+      </table>
+    </div></div>
+    <p class="sx-foot">Builder payments are counted in ETH and shown at today's ETH price. "0 blocks behind" means the liquidity was taken in the same block it was freed.</p>
+  </section>
+
+  <section class="sx-sec" id="activity">
+    <h2 class="sx-h2">Latest repayments and who got them</h2>
+    <div class="sx-card"><div class="sx-scroll">
+      <table class="sx-table" data-source="flows" data-row-key="tx">
+        <thead><tr><th data-field="time_bkk">Bangkok time</th><th data-field="kind">Event</th><th data-field="who">By</th><th class="r" data-field="amount">USDS freed</th><th data-field="taken_by">Taken by</th><th data-field="taker_kind">Taker</th><th class="r" data-field="taken">USDS taken</th><th class="r" data-field="lag_blocks">Blocks later</th><th class="r" data-field="pay_pct">Paid to builder</th></tr></thead>
+        <tbody data-draw="rows" data-table="flows"></tbody>
+      </table>
+    </div></div>
+    <h2 class="sx-h2" id="botlog-h">What the bot did</h2>
+    <div class="sx-card"><div class="sx-scroll">
+      <table class="sx-table" data-source="botlog" data-row-key="id">
+        <thead><tr><th data-field="time_bkk">Bangkok time</th><th class="r" data-field="block">Block</th><th data-field="what">Action</th><th data-field="note">Details</th></tr></thead>
+        <tbody data-draw="rows" data-table="botlog"></tbody>
+      </table>
+    </div></div>
+    <h2 class="sx-h2" id="alerts-h">Notifications sent to your phone</h2>
+    <div class="sx-card"><div class="sx-scroll">
+      <table class="sx-table" data-source="alerts" data-row-key="id">
+        <thead><tr><th data-field="time_bkk">Bangkok time</th><th data-field="title">Title</th><th data-field="body">Message</th></tr></thead>
+        <tbody data-draw="rows" data-table="alerts"></tbody>
+      </table>
+    </div></div>
+  </section>
+
+  <section class="sx-sec" id="scenarios">
+    <h2 class="sx-h2">Rehearsed scenarios</h2>
+    <p class="sx-note">Rehearsals, not live results: the bot's real code ran against a private copy of mainnet with live exchange prices. They show what the bot does when it is alone; in an open race other bots decide who lands first.</p>
+    <div class="sx-card"><div class="sx-scroll">
+      <table class="sx-table" data-source="sims" data-row-key="id">
+        <thead><tr><th data-field="id">#</th><th data-field="title">What happens</th><th data-field="setup">Setup</th><th data-field="route">How the bot gets in</th><th class="r" data-field="exit_usds">Withdrawn, USDS</th><th class="r" data-field="exit_tip_usd">Exit tip, USD</th><th class="r" data-field="arb_buy">Arb size, USDS</th><th class="r" data-field="arb_profit">Arb profit kept</th><th class="r" data-field="arb_tip">Arb tip</th><th data-field="note">Note</th></tr></thead>
+        <tbody data-draw="rows" data-table="sims"></tbody>
+      </table>
+    </div></div>
+  </section>
+</div>
+
+<script>
+  // Every source is one read-only SQL query on Supabase; its answer arrives as text with the rows as JSON inside.
+  const SOURCES = ['now', 'history', 'loans', 'daily', 'rivals', 'flows', 'botlog', 'sims', 'alerts'];
+  for (const id of SOURCES) {
+    dash.loader(id, {
+      description: 'Takes the JSON rows out of the Supabase answer, turns numeric text into numbers, and (for the snapshot) spreads the stored snapshot fields into columns.',
+      fn: ({answer}) => {
+        const text = typeof answer === 'string' ? answer : JSON.stringify(answer);
+        const m = text.match(/<untrusted-data-[^>]*>\s*([\s\S]*?)\s*<\/untrusted-data-/);
+        if (!m) throw new Error(text.slice(0, 240));
+        const num = (v) => (typeof v === 'string' && /^-?\d+(\.\d+)?$/.test(v) && v.length < 16 ? Number(v) : v);
+        return JSON.parse(m[1]).map((row) => {
+          const d = row.d && typeof row.d === 'object' ? row.d : typeof row.d === 'string' ? JSON.parse(row.d) : null;
+          const out = {};
+          for (const [k, v] of Object.entries({...(d || {}), ...row})) if (k !== 'd') out[k] = num(v);
+          return out;
+        });
+      },
+    });
+  }
+</script>
+
+<script>
+  const SX = (window.SX = {});
+  SX.rows = (id) => { const g = dash.data(id); return {status: g.status, rows: g.status === 'ok' && Array.isArray(g.data) ? g.data : []}; };
+  const n = (v, d) => Number(v).toLocaleString('en-US', {minimumFractionDigits: d, maximumFractionDigits: d});
+  SX.fmt = {
+    int: (v) => n(v, 0), plain: (v) => String(v), text: (v) => String(v),
+    usd2: (v) => n(v, 2), usd4: (v) => '$' + n(v, 4), px4: (v) => n(v, 4), eth3: (v) => n(v, 3),
+    pct0: (v) => n(v, 0) + '%', pct1: (v) => n(v, 1) + '%', pct2: (v) => n(v, 2) + '%', pct3: (v) => n(v, 3) + '%',
+    short: (v) => (Math.abs(v) >= 1e6 ? n(v / 1e6, 1) + 'M' : Math.abs(v) >= 1e4 ? n(v / 1e3, 0) + 'K' : n(v, 0)),
+  };
+  const settle = (el, status) => { if (status !== 'loading') el.classList.remove('dash-skeleton'); };
+
+  // One figure from one field of a source's first row.
+  dash.draw('v', (el) => {
+    const {status, rows} = SX.rows(el.dataset.source);
+    settle(el, status);
+    const v = rows[0] ? rows[0][el.dataset.field] : null;
+    el.textContent = v === null || v === undefined || v === '' ? '—' : SX.fmt[el.dataset.fmt || 'plain'](v);
+  });
+
+  dash.draw('meter', (el) => {
+    const r = SX.rows('now').rows[0];
+    const bar = document.createElement('i');
+    if (r) { bar.style.width = Math.max(0, Math.min(100, r.util_pct)) + '%'; if (r.util_pct < 99.9) bar.className = 'is-open'; }
+    el.replaceChildren(bar);
+    el.setAttribute('role', 'img');
+    el.setAttribute('aria-label', r ? 'Share of deposits lent out: ' + SX.fmt.pct3(r.util_pct) : 'Share of deposits lent out');
+  });
+
+  const CHECKS = {
+    bot: (r) => (r.bot_enabled ? ['ok', 'On'] : ['bad', 'Switched off']),
+    target: (r) => (r.bot_target === 'main' ? ['ok', 'Main wallet'] : ['warn', 'Test wallet only']),
+    approval: (r) => (r.main_allowance > 0 ? ['ok', 'Signed'] : ['bad', 'Not signed yet']),
+    key: (r) => (r.keeper_eth >= r.tip_cap_eth ? ['ok', 'Funded for a full exit'] : r.keeper_eth >= 0.01 ? ['warn', 'Enough for small exits only'] : ['bad', 'Nearly empty']),
+    safe: (r) => (r.safe_ok ? ['ok', 'Reading both queues'] : ['bad', 'Blind: needs a Safe API key']),
+    mempool: (r) => (!r.mempool_enabled ? ['bad', 'Off'] : r.mempool_age_s !== null && r.mempool_age_s !== undefined && r.mempool_age_s < 300 ? ['ok', 'Watching'] : ['warn', 'No recent heartbeat']),
+    arb: (r) => (r.arb_enabled ? ['ok', 'On'] : ['warn', 'Off']),
+    liq: (r) => (r.liquidations_stopped === 0 ? ['ok', 'On'] : ['warn', 'Switched off by Sky']),
+  };
+  const ICON = {ok: '✓', warn: '!', bad: '✕'};
+  dash.draw('st', (el) => {
+    const {status, rows} = SX.rows('now');
+    settle(el, status);
+    el.classList.remove('is-ok', 'is-warn', 'is-bad');
+    if (!rows[0]) { el.textContent = '—'; return; }
+    const [level, word] = CHECKS[el.dataset.check](rows[0]);
+    const icon = document.createElement('i');
+    icon.textContent = ICON[level];
+    icon.setAttribute('aria-hidden', 'true');
+    el.replaceChildren(icon, document.createTextNode(word));
+    el.classList.add('is-' + level);
+  });
+
+  // Which sentences apply, and whether the snapshot is fresh.
+  dash.onData(() => {
+    const r = SX.rows('now').rows[0];
+    const show = (id, on) => { const e = document.getElementById(id); if (e) e.hidden = !on; };
+    const open = !!r && r.available >= 1000;
+    show('takeaway-locked', !open); show('takeaway-open', open);
+    const armed = !!r && !!r.main_armed;
+    show('takeaway-unarmed', !armed); show('takeaway-armed', armed);
+    show('rates-due', !r || !!r.rates_change_due); show('rates-wait', !!r && !r.rates_change_due);
+    const dot = document.getElementById('live-dot');
+    if (dot) dot.classList.toggle('is-stale', !!r && r.age_s > 240);
+    document.querySelectorAll('.sx-legend i[data-swatch]').forEach((s) => { s.style.background = dash.colors[Number(s.dataset.swatch)]; });
+  });
+
+  // Reload while the page is open: the fast-moving sources every minute, the rest every ten.
+  let ticks = 0;
+  setInterval(() => {
+    if (document.visibilityState !== 'visible') return;
+    ticks += 1;
+    for (const id of ticks % 10 === 0 ? ['now', 'history', 'loans', 'daily', 'rivals', 'flows', 'botlog', 'sims', 'alerts'] : ['now', 'flows', 'botlog']) dash.refresh(id);
+  }, 60000);
+</script>
+
+<script>
+  // Tables: one drawing fills each <tbody> from its source.
+  const F = window.SX.fmt;
+  const HEX = /^0x[0-9a-fA-F]{40}$|^0x[0-9a-fA-F]{64}$/;
+  const cell = (cls, child) => { const td = document.createElement('td'); if (cls) td.className = cls; if (child !== null && child !== undefined) td.append(child); return td; };
+  const addr = (v) => {
+    if (v === null || v === undefined || v === '') return document.createTextNode('—');
+    const s = String(v);
+    if (!HEX.test(s)) return document.createTextNode(s);
+    const a = document.createElement('a');
+    a.href = 'https://etherscan.io/' + (s.length === 66 ? 'tx/' : 'address/') + s;
+    a.target = '_blank'; a.rel = 'noopener noreferrer'; a.className = 'mono';
+    a.textContent = s.slice(0, 6) + '…' + s.slice(-4);
+    return a;
+  };
+  const numOr = (v, f) => (v === null || v === undefined || v === '' ? '—' : F[f](v));
+  const tag = (text, level) => { const s = document.createElement('span'); s.className = 'sx-tag' + (level ? ' is-' + level : ''); s.textContent = text; return s; };
+  const TABLES = {
+    loans: {key: (r) => r.urn, cols: (r) => [cell('', r.owner), cell('r', numOr(r.debt, 'int')), cell('r', numOr(r.share_pct, 'pct1')), cell('r', numOr(r.sky, 'short')), cell('r', numOr(r.cover_pct, 'pct0')), cell('r', r.liq_price === null ? '—' : '$' + F.px4(r.liq_price)), cell('', tag(r.state, r.state === 'Covered' ? 'ok' : 'bad'))]},
+    rivals: {key: (r) => encodeURIComponent(r.entity) + ',' + encodeURIComponent(r.kind), cols: (r) => [cell('', addr(r.entity)), cell('nw', r.kind), cell('r', numOr(r.takes, 'int')), cell('r', numOr(r.usds, 'int')), cell('r', numOr(r.pay_pct, 'pct2')), cell('r', numOr(r.best_lag, 'int')), cell('nw dim', r.first_bkk), cell('nw dim', r.last_bkk)]},
+    flows: {key: (r) => r.tx, cols: (r) => [cell('nw', r.time_bkk), cell('nw', r.kind), cell('', addr(r.who)), cell('r', numOr(r.amount, 'int')), cell('', addr(r.taken_by)), cell('nw', r.taker_kind || '—'), cell('r', numOr(r.taken, 'int')), cell('r', numOr(r.lag_blocks, 'int')), cell('r', numOr(r.pay_pct, 'pct2'))]},
+    botlog: {key: (r) => String(r.id), cols: (r) => [cell('nw', r.time_bkk), cell('r dim', r.block === null ? '—' : String(r.block)), cell('nw', r.what), cell('', r.note || '—')]},
+    alerts: {key: (r) => String(r.id), cols: (r) => [cell('nw', r.time_bkk), cell('nw', r.title), cell('', r.body)]},
+    sims: {key: (r) => String(r.id), cols: (r) => [cell('', String(r.id)), cell('', r.title), cell('nw', r.setup), cell('nw', r.route), cell('r', numOr(r.exit_usds, 'usd2')), cell('r', numOr(r.exit_tip_usd, 'int')), cell('r', r.arb_buy ? F.int(r.arb_buy) : '—'), cell('r', r.arb_buy ? F.int(r.arb_profit) : '—'), cell('r', r.arb_buy ? F.int(r.arb_tip) : '—'), cell('dim', r.note)]},
+  };
+  dash.draw('rows', (tbody) => {
+    const id = tbody.dataset.table, spec = TABLES[id];
+    const {status, rows} = window.SX.rows(id);
+    const span = tbody.closest('table').querySelectorAll('th').length;
+    const message = (text) => { const tr = document.createElement('tr'); const td = cell('dim', text); td.colSpan = span; tr.append(td); tbody.replaceChildren(tr); };
+    if (status === 'loading') return message('Loading…');
+    if (status === 'error') return message('This table could not be loaded.');
+    if (status !== 'ok') return message('—');
+    if (!rows.length) return message('Nothing yet.');
+    tbody.replaceChildren(...rows.map((r) => { const tr = document.createElement('tr'); tr.dataset.key = spec.key(r); tr.append(...spec.cols(r)); return tr; }));
+  });
+</script>
+
+<script>
+  // Charts. Times are shifted by seven hours and drawn on a UTC scale, so every label is Bangkok time.
+  const SXc = window.SX, Fc = SXc.fmt;
+  const BKK = 7 * 3600 * 1000;
+  const note = (el, text) => { const p = document.createElement('p'); p.className = 'sx-empty'; p.textContent = text; el.replaceChildren(p); };
+  const guard = (el, status, rows, min) => {
+    if (status === 'loading') { note(el, 'Loading…'); return false; }
+    if (status === 'error') { note(el, 'This chart could not be loaded.'); return false; }
+    if (status !== 'ok') { note(el, '—'); return false; }
+    if (rows.length < min) { note(el, 'Collecting data. The first points appear within a few minutes.'); return false; }
+    return true;
+  };
+  const tipBox = (el) => { const t = document.createElement('div'); t.className = 'sx-tip'; t.hidden = true; el.append(t); return t; };
+  const place = (el, tip, x, y) => {
+    tip.hidden = false;
+    const w = tip.offsetWidth, W = el.clientWidth;
+    tip.style.left = Math.max(0, Math.min(W - w, x + 12 + w > W ? x - w - 12 : x + 12)) + 'px';
+    tip.style.top = Math.max(0, y - 34) + 'px';
+  };
+  const tipLines = (tip, head, lines) => {
+    const h = document.createElement('em'); h.textContent = head;
+    tip.replaceChildren(h, ...lines.flatMap((l) => [document.createElement('br'), document.createTextNode(l)]));
+  };
+
+  SXc.line = (el, rows, o) => {
+    el.replaceChildren();
+    const W = Math.max(260, el.clientWidth), H = 200, m = {t: 14, r: 16, b: 26, l: 52};
+    const pts = rows.filter((d) => d[o.y] !== null && d[o.y] !== undefined).map((d) => ({T: new Date(Number(d.t) + BKK), v: Number(d[o.y])}));
+    const svg = d3.select(el).append('svg').attr('width', W).attr('height', H).attr('role', 'img').attr('aria-label', o.label);
+    const x = d3.scaleUtc().domain(d3.extent(pts, (d) => d.T)).range([m.l, W - m.r]);
+    const all = pts.map((d) => d.v).concat((o.refs || []).map((r) => r.v));
+    const lo = d3.min(all), hi = d3.max(all), pad = (hi - lo || Math.abs(hi) * 0.1 || 1) * 0.15;
+    const y = d3.scaleLinear().domain([lo - pad, hi + pad]).range([H - m.b, m.t]);
+    const g = svg.append('g');
+    for (const t of y.ticks(4)) {
+      g.append('line').attr('x1', m.l).attr('x2', W - m.r).attr('y1', y(t)).attr('y2', y(t)).style('stroke', 'var(--cds-chart-grid)');
+      g.append('text').attr('x', m.l - 8).attr('y', y(t)).attr('dy', '0.32em').attr('text-anchor', 'end').text(o.tick(t));
+    }
+    const span = x.domain()[1] - x.domain()[0];
+    const tf = d3.utcFormat(span > 36 * 3600e3 ? '%d %b' : '%H:%M');
+    for (const t of x.ticks(Math.max(2, Math.floor((W - m.l - m.r) / 90)))) g.append('text').attr('x', x(t)).attr('y', H - 6).attr('text-anchor', 'middle').text(tf(t));
+    for (const r of o.refs || []) {
+      g.append('line').attr('x1', m.l).attr('x2', W - m.r).attr('y1', y(r.v)).attr('y2', y(r.v)).style('stroke', 'var(--cds-chart-reference)').style('stroke-dasharray', '4 4');
+      g.append('text').attr('class', 'sx-val').attr('x', W - m.r).attr('y', y(r.v) - 6).attr('text-anchor', 'end').text(r.label);
+    }
+    svg.append('path').attr('fill', 'none').style('stroke', dash.colors[0]).style('stroke-width', 2).style('stroke-linejoin', 'round').attr('d', d3.line().x((d) => x(d.T)).y((d) => y(d.v))(pts));
+    const last = pts[pts.length - 1];
+    svg.append('circle').attr('cx', x(last.T)).attr('cy', y(last.v)).attr('r', 4).style('fill', dash.colors[0]).style('stroke', 'var(--color-panel)').style('stroke-width', 2);
+    const cross = svg.append('line').attr('y1', m.t).attr('y2', H - m.b).style('stroke', 'var(--cds-chart-axis)').style('display', 'none');
+    const dot = svg.append('circle').attr('r', 4).style('fill', dash.colors[0]).style('stroke', 'var(--color-panel)').style('stroke-width', 2).style('display', 'none');
+    const tip = tipBox(el), bis = d3.bisector((d) => d.T).center, full = d3.utcFormat('%d %b %H:%M');
+    svg.append('rect').attr('x', m.l).attr('y', m.t).attr('width', W - m.l - m.r).attr('height', H - m.t - m.b).style('fill', 'transparent')
+      .on('pointermove', (ev) => {
+        const [px] = d3.pointer(ev);
+        const d = pts[bis(pts, x.invert(px))];
+        cross.style('display', null).attr('x1', x(d.T)).attr('x2', x(d.T));
+        dot.style('display', null).attr('cx', x(d.T)).attr('cy', y(d.v));
+        tipLines(tip, full(d.T) + ' Bangkok', [o.name + ': ' + o.tick(d.v)]);
+        place(el, tip, x(d.T), y(d.v));
+      })
+      .on('pointerleave', () => { cross.style('display', 'none'); dot.style('display', 'none'); tip.hidden = true; });
+  };
+
+  SXc.bars = (el, rows, o) => {
+    el.replaceChildren();
+    const W = Math.max(260, el.clientWidth), H = 200, m = {t: 20, r: 8, b: 26, l: 36};
+    const svg = d3.select(el).append('svg').attr('width', W).attr('height', H).attr('role', 'img').attr('aria-label', o.label);
+    const x = d3.scaleBand().domain(rows.map((d) => d.day)).range([m.l, W - m.r]).paddingInner(0.3).paddingOuter(0.15);
+    const total = (d) => d3.sum(o.keys, (k) => Number(d[k.k]) || 0);
+    const y = d3.scaleLinear().domain([0, (d3.max(rows, total) || 1) * 1.12]).range([H - m.b, m.t]);
+    const g = svg.append('g');
+    for (const t of y.ticks(4)) {
+      g.append('line').attr('x1', m.l).attr('x2', W - m.r).attr('y1', y(t)).attr('y2', y(t)).style('stroke', 'var(--cds-chart-grid)');
+      g.append('text').attr('x', m.l - 8).attr('y', y(t)).attr('dy', '0.32em').attr('text-anchor', 'end').text(o.tick(t));
+    }
+    const parse = d3.utcParse('%Y-%m-%d'), dayf = d3.utcFormat('%d %b');
+    const every = Math.max(1, Math.ceil(rows.length / Math.max(2, Math.floor((W - m.l - m.r) / 54))));
+    const tip = tipBox(el);
+    rows.forEach((d, i) => {
+      const cx = x(d.day) + x.bandwidth() / 2;
+      if ((rows.length - 1 - i) % every === 0) g.append('text').attr('x', cx).attr('y', H - 6).attr('text-anchor', 'middle').text(dayf(parse(d.day)));
+      let base = 0;
+      o.keys.forEach((k) => {
+        const v = Number(d[k.k]) || 0;
+        if (!v) return;
+        const top = y(base + v), bottom = y(base) - (base ? 2 : 0);
+        svg.append('rect').attr('x', x(d.day)).attr('width', x.bandwidth()).attr('y', top).attr('height', Math.max(1, bottom - top)).attr('rx', 3).style('fill', dash.colors[k.c]);
+        base += v;
+      });
+      const sum = total(d);
+      if (sum && x.bandwidth() >= 22) svg.append('text').attr('class', 'sx-val').attr('x', cx).attr('y', y(sum) - 5).attr('text-anchor', 'middle').text(o.tick(sum));
+      svg.append('rect').attr('x', x(d.day) - x.step() * 0.15).attr('width', x.step()).attr('y', m.t).attr('height', H - m.t - m.b).style('fill', 'transparent')
+        .on('pointermove', () => { tipLines(tip, dayf(parse(d.day)), o.keys.map((k) => k.name + ': ' + (d[k.k] === null || d[k.k] === undefined ? 'no data' : o.tick(Number(d[k.k]))))); place(el, tip, cx, y(sum)); })
+        .on('pointerleave', () => { tip.hidden = true; });
+    });
+  };
+
+  dash.draw('chart-discount', (el) => {
+    const {status, rows} = SXc.rows('history');
+    if (!guard(el, status, rows.filter((d) => d.dex_discount_pct !== null), 2)) return;
+    SXc.line(el, rows, {y: 'dex_discount_pct', name: 'Discount', tick: (v) => Fc.pct1(v), label: 'Line chart of the stUSDS discount on exchanges over time'});
+  });
+  dash.draw('chart-sky', (el) => {
+    const {status, rows} = SXc.rows('history');
+    if (!guard(el, status, rows.filter((d) => d.sky_usd !== null), 2)) return;
+    const now = SXc.rows('now').rows[0];
+    SXc.line(el, rows, {y: 'sky_usd', name: 'SKY', tick: (v) => '$' + Fc.px4(v), refs: now ? [{v: Number(now.sky_loan_price), label: 'Loans valued at $' + Fc.px4(now.sky_loan_price)}] : [], label: 'Line chart of the SKY price over time with the price loans are valued at'});
+  });
+  dash.draw('chart-bots', (el) => {
+    const {status, rows} = SXc.rows('daily');
+    if (!guard(el, status, rows, 1)) return;
+    const data = rows.map((d) => ({day: d.day, old_bots: Number(d.arb_bots) - Number(d.new_arb_bots), new_arb_bots: Number(d.new_arb_bots)}));
+    SXc.bars(el, data, {keys: [{k: 'old_bots', name: 'Seen before', c: 0}, {k: 'new_arb_bots', name: 'First seen that day', c: 1}], tick: (v) => Fc.int(v), label: 'Stacked bar chart of arb bots that won liquidity each day, split into new and returning'});
+  });
+  dash.draw('chart-pay', (el) => {
+    const {status, rows} = SXc.rows('daily');
+    if (!guard(el, status, rows, 1)) return;
+    SXc.bars(el, rows, {keys: [{k: 'arb_pay_pct', name: 'Paid to builders', c: 0}], tick: (v) => Fc.pct1(v), label: 'Bar chart of the share of taken USDS that winning arb bots paid to block builders each day'});
+  });
+</script>

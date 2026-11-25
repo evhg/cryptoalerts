@@ -1,0 +1,146 @@
+{
+  "alerts": {
+    "title": "Push notifications sent",
+    "description": "The latest stUSDS notifications sent to your phone through Jarvis.",
+    "langs": {
+      "query": "sql"
+    },
+    "source": {
+      "kind": "call",
+      "connector": "Supabase",
+      "tool": "execute_sql",
+      "args": {
+        "project_id": "vaelokyqjdsxveqvdtbo",
+        "query": "select * from stusds_alert.v_dash_alerts"
+      }
+    }
+  },
+  "botlog": {
+    "title": "Bot activity",
+    "description": "What the withdrawal bot did most recently (routine polling left out).",
+    "langs": {
+      "query": "sql"
+    },
+    "source": {
+      "kind": "call",
+      "connector": "Supabase",
+      "tool": "execute_sql",
+      "args": {
+        "project_id": "vaelokyqjdsxveqvdtbo",
+        "query": "select * from stusds_alert.v_dash_botlog"
+      }
+    }
+  },
+  "daily": {
+    "title": "Who took freed liquidity, by day",
+    "description": "Per Bangkok day: how many different bots and holders took withdrawable USDS, how much, and what arb bots paid block builders.",
+    "langs": {
+      "query": "sql"
+    },
+    "source": {
+      "kind": "call",
+      "connector": "Supabase",
+      "tool": "execute_sql",
+      "args": {
+        "project_id": "vaelokyqjdsxveqvdtbo",
+        "query": "select * from stusds_alert.v_dash_daily"
+      }
+    }
+  },
+  "flows": {
+    "title": "Recent repayments and what happened to them",
+    "description": "The latest repayments and deposits of 1,000 USDS or more, with whoever withdrew right after.",
+    "langs": {
+      "query": "sql"
+    },
+    "source": {
+      "kind": "call",
+      "connector": "Supabase",
+      "tool": "execute_sql",
+      "args": {
+        "project_id": "vaelokyqjdsxveqvdtbo",
+        "query": "select * from stusds_alert.v_dash_flows"
+      }
+    }
+  },
+  "history": {
+    "title": "History, last 3 days",
+    "description": "Minute snapshots thinned to every five minutes (every minute for the last three hours).",
+    "langs": {
+      "query": "sql"
+    },
+    "source": {
+      "kind": "call",
+      "connector": "Supabase",
+      "tool": "execute_sql",
+      "args": {
+        "project_id": "vaelokyqjdsxveqvdtbo",
+        "query": "select * from stusds_alert.v_dash_history"
+      }
+    }
+  },
+  "loans": {
+    "title": "Largest SKY-backed loans",
+    "description": "The ten largest loans against staked SKY, which make up almost all of the money lent out of stUSDS.",
+    "langs": {
+      "query": "sql"
+    },
+    "source": {
+      "kind": "call",
+      "connector": "Supabase",
+      "tool": "execute_sql",
+      "args": {
+        "project_id": "vaelokyqjdsxveqvdtbo",
+        "query": "select * from stusds_alert.v_dash_loans"
+      }
+    }
+  },
+  "now": {
+    "title": "Snapshot",
+    "description": "The latest one-minute snapshot of stUSDS, prices, your wallets and the bot's switches.",
+    "langs": {
+      "query": "sql"
+    },
+    "source": {
+      "kind": "call",
+      "connector": "Supabase",
+      "tool": "execute_sql",
+      "args": {
+        "project_id": "vaelokyqjdsxveqvdtbo",
+        "query": "select * from stusds_alert.v_dash_now"
+      }
+    }
+  },
+  "rivals": {
+    "title": "Competing takers",
+    "description": "Every address that took freed stUSDS liquidity since mid-November, largest first. Payments use today's ETH price.",
+    "langs": {
+      "query": "sql"
+    },
+    "source": {
+      "kind": "call",
+      "connector": "Supabase",
+      "tool": "execute_sql",
+      "args": {
+        "project_id": "vaelokyqjdsxveqvdtbo",
+        "query": "select * from stusds_alert.v_dash_rivals"
+      }
+    }
+  },
+  "sims": {
+    "title": "Rehearsed scenarios",
+    "description": "Rehearsals of the bot's real code on a private copy of mainnet with live DEX prices. Not live results.",
+    "langs": {
+      "query": "sql"
+    },
+    "source": {
+      "kind": "call",
+      "connector": "Supabase",
+      "tool": "execute_sql",
+      "args": {
+        "project_id": "vaelokyqjdsxveqvdtbo",
+        "query": "select * from stusds_alert.v_dash_sims"
+      }
+    }
+  }
+}

@@ -88,105 +88,160 @@ export async function availableUsds(client: PublicClient): Promise<bigint> {
   return total > debt ? (total - debt) / RAY : 0n
 }
 
+/** KyberSwap's API turns away bursts with 403/429; wait a moment and ask again. */
+async function kyberFetch(url: string, init: RequestInit): Promise<any> {
+  let last = ''
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (attempt) await new Promise((r) => setTimeout(r, attempt === 1 ? 350 : 1100))
+    try {
+      const r = await fetch(url, { ...init, signal: AbortSignal.timeout(4000) })
+      const text = await r.text()
+      if (r.status === 403 || r.status === 429 || r.status >= 500) {
+        last = `${r.status} ${text.slice(0, 80)}`
+        continue
+      }
+      return JSON.parse(text)
+    } catch (e) {
+      last = String(e).slice(0, 80)
+    }
+  }
+  throw new Error(`kyber unavailable: ${last}`)
+}
+
 async function kyberQuote(tokenIn: string, tokenOut: string, amountIn: bigint) {
-  const r = await fetch(`${KYBER}/routes?tokenIn=${tokenIn}&tokenOut=${tokenOut}&amountIn=${amountIn}`, { headers: KYBER_HEADERS, signal: AbortSignal.timeout(4000) })
-  const j = await r.json()
+  const j = await kyberFetch(`${KYBER}/routes?tokenIn=${tokenIn}&tokenOut=${tokenOut}&amountIn=${amountIn}`, { headers: KYBER_HEADERS })
   if (!j?.data?.routeSummary) throw new Error(`kyber quote failed: ${JSON.stringify(j).slice(0, 120)}`)
   return j.data.routeSummary
 }
 
 async function kyberBuild(summary: unknown, arb: Hex, slippageBps: number) {
-  const r = await fetch(`${KYBER}/route/build`, {
+  const j = await kyberFetch(`${KYBER}/route/build`, {
     method: 'POST',
     headers: KYBER_HEADERS,
     body: JSON.stringify({ routeSummary: summary, sender: arb, recipient: arb, slippageTolerance: slippageBps, deadline: Math.floor(Date.now() / 1000) + 300, skipSimulateTx: true }),
-    signal: AbortSignal.timeout(4000),
   })
-  const j = await r.json()
   if (j?.code !== 0 || !j?.data?.data) throw new Error(`kyber build failed: ${JSON.stringify(j).slice(0, 120)}`)
   if (getAddress(j.data.routerAddress) !== getAddress(KYBER_ROUTER)) throw new Error('kyber returned another router')
   return { data: j.data.data as Hex, amountOut: BigInt(j.data.amountOut) }
 }
 
-const LADDER = [2_000n, 5_000n, 10_000n, 25_000n, 50_000n, 100_000n, 200_000n, 300_000n, 500_000n, 750_000n, 1_000_000n]
+// Buy sizes whose prices bracket any opening. The collector (stusds-dash) refreshes this
+// ladder every minute and the bot reads it from Postgres, so that at fire time only the
+// chosen size has to be quoted: KyberSwap turns away bursts of requests.
+export const LADDER = [5_000n, 20_000n, 60_000n, 150_000n, 350_000n, 750_000n]
 
-/** Pick the buy size with the most profit that Sky can still pay out in full. */
-export async function sizeArb(client: PublicClient, availableWad: bigint) {
+export type Ladder = { nav: bigint; quotes: { amountIn: bigint; shares: bigint }[] }
+
+/** Price the ladder now (fallback when the stored one is missing or old). One request at a time. */
+export async function ladderQuotes(client: PublicClient): Promise<Ladder> {
   const nav = await client.readContract({ address: ST_USDS, abi: parseAbi(['function convertToAssets(uint256) view returns (uint256)']), functionName: 'convertToAssets', args: [10n ** 18n] })
-  const sizes = LADDER.map((s) => s * 10n ** 18n).filter((s) => s <= availableWad)
-  if (!sizes.length) return null
-  const quotes = await Promise.all(sizes.map((s) => kyberQuote(USDS, ST_USDS, s).then((q) => ({ s, q })).catch(() => null)))
-  let best: { amountIn: bigint; shares: bigint; profit: bigint; summary: unknown } | null = null
-  for (const x of quotes) {
-    if (!x) continue
-    const shares = BigInt(x.q.amountOut)
-    const value = (shares * nav) / 10n ** 18n
-    if (value > (availableWad * 995n) / 1000n) continue // Sky must be able to pay all of it, with margin
-    const profit = value - x.s
-    if (profit > 0n && (!best || profit > best.profit)) best = { amountIn: x.s, shares, profit, summary: x.q }
+  const quotes: Ladder['quotes'] = []
+  for (const s of LADDER) {
+    const amountIn = s * 10n ** 18n
+    const q = await kyberQuote(USDS, ST_USDS, amountIn).catch(() => null)
+    if (q) quotes.push({ amountIn, shares: BigInt(q.amountOut) })
   }
-  return best ? { ...best, nav } : null
+  return { nav, quotes }
+}
+
+/**
+ * How much USDS to spend: the most profitable size whose redemption Sky can pay
+ * in full. The ladder only brackets it, so a 39.9k opening is bid for as 39.9k
+ * and not as the step below it. Pure arithmetic; the size is quoted afterwards.
+ */
+export function chooseSize(l: Ladder, availableWad: bigint): bigint | null {
+  const value = (q: { shares: bigint }) => (q.shares * l.nav) / 10n ** 18n
+  const cap = (availableWad * 990n) / 1000n
+  const quotes = [...l.quotes].sort((a, b) => (a.amountIn < b.amountIn ? -1 : 1))
+  const fits = quotes.filter((q) => value(q) <= cap)
+  const over = quotes.find((q) => value(q) > cap)
+  let best: { amountIn: bigint; profit: bigint } | null = null
+  for (const q of fits) {
+    const profit = value(q) - q.amountIn
+    if (profit > 0n && (!best || profit > best.profit)) best = { amountIn: q.amountIn, profit }
+  }
+  if (over) {
+    // Below `over`, each USDS buys at least as many shares as at the lower step's
+    // average price, so sizing with that price can only undershoot the cap.
+    const lower = fits[fits.length - 1]
+    const target = lower ? (cap * lower.amountIn) / value(lower) : (cap * over.amountIn * 97n) / (value(over) * 100n)
+    const amountIn = (target / 10n ** 18n) * 10n ** 18n
+    // Value it at the worse of the two neighbouring prices.
+    const estValue = (amountIn * value(over)) / over.amountIn
+    const profit = estValue - amountIn
+    if (amountIn >= 500n * 10n ** 18n && profit > 0n && (!best || profit > best.profit)) best = { amountIn, profit }
+  }
+  return best ? best.amountIn : null
 }
 
 export type BundleSim = (raws: Hex[]) => Promise<{ ok: boolean; results: { error?: string; value?: string; gasUsed?: number }[]; raw?: unknown }>
 
+const ARB_GAS_LIMIT = 4_200_000n // measured 2.1M without and 2.4M with the tip swap
+
 /**
  * Plan, simulate and sign one arb run that follows `preceding` (already signed
- * transactions, e.g. the Safe repayment and the main exit) in the same bundle.
- * Returns null when there is no profitable run.
+ * transactions, e.g. a repayment and the owner's exit) in the same bundle.
+ * One simulation only: the tip is set from the quoted profit, and the contract's
+ * own minimum-profit check is the backstop.
  */
 export async function planArb(opts: {
-  client: PublicClient
   arb: Hex
   availableWad: bigint // USDS left for the arb after everything in `preceding`
+  ladder: Ladder // price ladder, at most a few minutes old
   preceding: Hex[]
   sign: (to: Hex, data: Hex, gas: bigint) => Promise<{ raw: Hex; hash: Hex }>
   simulate: BundleSim
   tipShare: number // share of the profit offered to the builder
   minNetUsds: number
 }) {
-  const size = await sizeArb(opts.client, opts.availableWad)
-  if (!size) return { skipped: 'no profitable size' }
-  const buy = await kyberBuild(size.summary, opts.arb, 100)
-  const plan = (tipUsds: bigint, tipData: Hex, minNet: bigint) =>
-    encodeFunctionData({ abi: arbAbi, functionName: 'arb', args: [{ flash: size.amountIn, buyData: buy.data, tipUsds, tipData, minNet }] })
-
-  // 1. Dry run without a tip: what does it really make, at the end of this exact bundle?
-  const probe = await opts.sign(opts.arb, plan(0n, '0x', 0n), 3_000_000n)
-  const sim1 = await opts.simulate([...opts.preceding, probe.raw])
-  const r1 = sim1.results[sim1.results.length - 1]
-  if (!sim1.ok || !r1 || r1.error || !r1.value) return { skipped: `simulation failed: ${r1?.error ?? 'no result'}`, size: formatUnits(size.amountIn, 18) }
-  const net0 = BigInt(r1.value)
-  const gasUsed = BigInt(r1.gasUsed ?? 2_000_000)
-
-  // 2. Offer the builder a share of that profit, paid out of it inside the run.
-  let tipUsds = (net0 * BigInt(Math.round(opts.tipShare * 10_000))) / 10_000n
-  let tipData: Hex = '0x'
-  if (tipUsds >= 10n ** 18n) {
-    const q = await kyberQuote(USDS, NATIVE, tipUsds)
-    // Loose router slippage: the contract itself rejects any rate below 97% of Chainlink.
-    tipData = (await kyberBuild(q, opts.arb, 300)).data
-  } else tipUsds = 0n
-  const floor = parseUnits(String(opts.minNetUsds), 18)
-  const keep = ((net0 - tipUsds) * 95n) / 100n
-  const minNet = keep > floor ? keep : floor
-  if (net0 - tipUsds < floor) return { skipped: 'profit below minimum', net0: formatUnits(net0, 18) }
-
-  // 3. Final run, simulated once more exactly as it will be sent.
-  // The dry run had no tip swap; leave room for it (gas is only paid for what is used).
-  const gasLimit = ((gasUsed + (tipUsds > 0n ? 900_000n : 0n)) * 125n) / 100n + 100_000n
-  const final = await opts.sign(opts.arb, plan(tipUsds, tipData, minNet), gasLimit)
-  const sim2 = await opts.simulate([...opts.preceding, final.raw])
-  const r2 = sim2.results[sim2.results.length - 1]
-  if (!sim2.ok || !r2 || r2.error || !r2.value) return { skipped: `final simulation failed: ${r2?.error ?? 'no result'}` }
-  if (BigInt(r2.gasUsed ?? 0) * 100n > gasLimit * 95n) return { skipped: 'final run too close to its gas limit' }
-  return {
-    raw: final.raw,
-    hash: final.hash,
-    buy_usds: formatUnits(size.amountIn, 18),
-    shares: formatUnits(size.shares, 18),
-    net_before_tip: formatUnits(net0, 18),
-    tip_usds: formatUnits(tipUsds, 18),
-    net: formatUnits(BigInt(r2.value), 18),
+  let amountIn = chooseSize(opts.ladder, opts.availableWad)
+  if (amountIn === null) return { skipped: 'no profitable size' }
+  // Quote exactly that size; if it turns out a touch too big for what Sky can pay, shrink once.
+  let best: { amountIn: bigint; shares: bigint; summary: unknown; profit: bigint } | null = null
+  for (let i = 0; i < 2 && !best; i++) {
+    const q = await kyberQuote(USDS, ST_USDS, amountIn)
+    const shares = BigInt(q.amountOut)
+    const value = (shares * opts.ladder.nav) / 10n ** 18n
+    if (value <= (opts.availableWad * 995n) / 1000n) best = { amountIn, shares, summary: q, profit: value - amountIn }
+    else amountIn = (((amountIn * 97n) / 100n) / 10n ** 18n) * 10n ** 18n
   }
+  if (!best) return { skipped: 'no size fits what Sky can pay out' }
+  if (best.profit <= 0n) return { skipped: 'no profit at this size', buy_usds: formatUnits(best.amountIn, 18) }
+  const floor = parseUnits(String(opts.minNetUsds), 18)
+  const attempt = async (share: number) => {
+    let tipUsds = (best.profit * BigInt(Math.round(share * 0.97 * 10_000))) / 10_000n
+    if (tipUsds < 10n ** 18n) tipUsds = 0n
+    if (best.profit - tipUsds < floor) return { skipped: 'profit below minimum', quoted_profit: formatUnits(best.profit, 18) }
+    const [buy, tip] = await Promise.all([
+      kyberBuild(best.summary, opts.arb, 100),
+      // Loose router slippage on the tip swap: the contract itself rejects any rate below 97% of Chainlink.
+      tipUsds > 0n ? kyberQuote(USDS, NATIVE, tipUsds).then((q) => kyberBuild(q, opts.arb, 300)) : Promise.resolve(null),
+    ])
+    // The buy may come in up to 1% short on shares; keep at least 70% of what is left after the tip.
+    const keep = ((best.profit - tipUsds) * 70n) / 100n
+    const minNet = keep > floor ? keep : floor
+    const data = encodeFunctionData({ abi: arbAbi, functionName: 'arb', args: [{ flash: best.amountIn, buyData: buy.data, tipUsds, tipData: (tip?.data ?? '0x') as Hex, minNet }] })
+    const signed = await opts.sign(opts.arb, data, ARB_GAS_LIMIT)
+    const sim = await opts.simulate([...opts.preceding, signed.raw])
+    const r = sim.results[opts.preceding.length]
+    if (!r || r.error || !r.value) return { skipped: `simulation failed: ${r?.error ?? JSON.stringify(sim.raw ?? 'no result').slice(0, 160)}` }
+    if (BigInt(r.gasUsed ?? 0) * 100n > ARB_GAS_LIMIT * 95n) return { skipped: 'run too close to its gas limit' }
+    return {
+      raw: signed.raw,
+      hash: signed.hash,
+      buy_usds: formatUnits(best.amountIn, 18),
+      shares: formatUnits(best.shares, 18),
+      quoted_profit: formatUnits(best.profit, 18),
+      tip_usds: formatUnits(tipUsds, 18),
+      net: formatUnits(BigInt(r.value), 18),
+      gas_used: r.gasUsed,
+    }
+  }
+  const first: any = await attempt(opts.tipShare)
+  if (first.raw || first.skipped === 'profit below minimum') return first
+  // One retry with a smaller tip, in case the quote was optimistic.
+  const second: any = await attempt(opts.tipShare * 0.6)
+  return second.raw ? { ...second, retried: first.skipped } : first
 }
+
+export { ARB_GAS_LIMIT }

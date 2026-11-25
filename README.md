@@ -116,11 +116,21 @@ Contracts (`contracts/src`, fork tests in `contracts/test`):
 - `StUsdsExit` — redeems the owner's stUSDS to the owner, only what Sky can pay, tip to the builder capped and paid from the caller's ETH. Main wallet: `0xbF54F2AA78b4c240e34224073aff9E89Cd915897`; test wallet: `0x01662b082432859c366ab16362eab10fb72c73e6`. The owner arms it with one `approve` on stUSDS (see `contracts/review/` for the second-opinion packet and an independent bytecode check).
 - `StUsdsArb` — flash-mints DAI, buys stUSDS below its redemption value through the KyberSwap router, redeems it at Sky, repays, tips the builder out of profit (checked against Chainlink) and sends the rest to the main wallet. Holds nothing between transactions and has no approval on anyone's funds. Deployed at `0xa2749a6d8de66523c9132d964b5c61d363a5fbe3`.
 
-Three routes, each sending the same bundle — the exit first, then the arb on what is left, plus a fallback bundle without the arb:
+Three routes. Each one first simulates the withdrawal followed by a read-only "lens" call at the builder (Flashbots `eth_callBundle`), which tells exactly how much USDS is withdrawable behind the triggering transaction whatever shape that transaction has. It then sends the exit bundle at once and, a moment later, a second bundle with the arb on what is left:
 - end of block (`fire`, from the block observer);
-- Safe route (`tick`, every ~5 s): a fully signed repayment in a watched borrower Safe is executed by the bot with its transactions right behind it;
-- backrun (`mempool`, pending-transaction feed): public repayments and stUSDS deposits.
+- Safe route (`tick`): a fully signed repayment in a watched borrower Safe is executed by the bot with its transactions right behind it. Needs the `SAFE_API_KEY` function secret (free key from developer.safe.global); without it Safe's public API allows about 5,000 requests a month and the route is blind;
+- backrun (`mempool`, pending-transaction feed): any pending transaction that touches the lending engine's repay functions or deposits into stUSDS, directly or through a Safe, a multicall, an ERC-4337 bundle or an EIP-7702 batch.
 
-Settings (`stusds_alert.exit_config`): `enabled`, `target_name`/`helper_address`, `fee_bps` (exit fee cap, default 10 = 0.1%), `fee_floor_usd`, `safe_route`, `watch_safe` (comma-separated), `arb_enabled`, `arb_address`, `arb_tip_share_safe` (0.3), `arb_tip_share_race` (0.7), `arb_min_net_usd` (25), `mempool_enabled`.
+Overlapping runs are de-duplicated through `stusds_exit_claim`. The arb sizes itself from the price ladder the collector keeps fresh, so only a handful of KyberSwap calls happen at fire time. `simcheck` runs the lens live; `status` reports wallets, code checks and whether the Safe API key is present.
+
+Settings (`stusds_alert.exit_config`): `enabled`, `target_name`/`helper_address`, `fee_bps` (exit fee cap, default 10 = 0.1%), `fee_floor_usd`, `safe_route`, `watch_safe` (comma-separated), `safe_poll_seconds` (10), `arb_enabled`, `arb_address`, `arb_tip_share_safe` (0.3), `arb_tip_share_race` (0.85), `arb_min_net_usd` (25), `mempool_enabled`.
 
 Tests: `cd contracts && forge test` (42 fork tests; `node test/fixtures/build-arb-fixture.mjs` refreshes the Kyber calldata fixture), `deno run --allow-net supabase/functions/stusds-exit/pending_test.ts` (pending-transaction decoder against real transactions).
+
+## Dashboard and collector (`supabase/functions/stusds-dash`, `dashboard/`)
+
+`stusds-dash` runs once a minute from pg_cron. It is read-only towards the chain and holds no keys. It stores a snapshot (`stusds_alert.dash_now`), a history row (`dash_history`), new repayments, deposits and withdrawals (`chain_events`), and who took freed liquidity and what they paid the block builder (`takers`). It also keeps the DEX price ladder the bot's arb uses, and sends a Jarvis push (each once) for: a repayment or new borrowing of 100,000 USDS or more, 100,000 or more repaid within an hour, a deposit of 250,000 or more, a rate change, a change of the liquidation switch, the borrowing limit or the deposit cap, SKY falling below $0.035 / $0.03 / $0.025 / $0.02, any change of the main wallet's stUSDS balance, the bot key running low on ETH, and the Safe watch being blind.
+
+`POST {"backfill": {"from": <block>, "to": <block>}}` loads history for an older block range.
+
+The live dashboard is a Claude dashboard artifact. Its page is `dashboard/index.html` and its queries are in `dashboard/datasets.json`; each one reads a view named `stusds_alert.v_dash_*` through the Supabase connector. All times are formatted in Bangkok time in the views.
