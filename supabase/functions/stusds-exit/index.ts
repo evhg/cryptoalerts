@@ -496,6 +496,16 @@ type Pick = { only?: string[]; except?: string[] }
 // block has written to that storage: every deposit or loan repayment writes stUSDS's own bookkeeping (slots 1 and 5),
 // and a repayment also writes the loan type's totals in Sky's ledger.
 // Quasar's version of the method names contracts only; it documents no per-slot field, so none is sent there.
+// Quasar tries such a bundle at the end of a block in which one of the named "pools" changed, and it did not run
+// ours when only stUSDS, Sky's ledger or our own probe contract was named (tested twice on 26 Nov 2026). Trading
+// venues that change in nearly every block are therefore named as well, so the bundle is tried at the end of every
+// Quasar block and simply fails there, at no cost, unless USDS has become withdrawable.
+const BUSY_POOLS = [
+  '0x000000000004444c5dc75cB358380D2e3dE08A90', // Uniswap v4 PoolManager (changes in ~99% of blocks)
+  '0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640', // Uniswap v3 USDC/WETH 0.05%
+  '0x11b815efB8f581194ae79006d24E0d814B7697F6', // Uniswap v3 WETH/USDT 0.05%
+  '0x2C7C98A3b1582D83c43987202aEFf638312478aE', // Curve stUSDS/USDS
+]
 const CONDITIONAL: Record<string, 'eob' | 'eob_pools' | 'v2'> = { titan: 'eob', quasar: 'eob_pools', bombora: 'eob', buildernet: 'v2' }
 const slot32 = (n: bigint) => toHex(n, { size: 32 })
 const ILK_ART_SLOT = 0x0b2fb9dcfebfeb5c8f6985ea98125a38a1adb70b7194dc26531c5e9ab986e533n // ilks[LSEV2-SKY-A] in the Vat
@@ -512,7 +522,7 @@ async function sendConditional(signer: PrivateKeyAccount, bundles: Hex[][], targ
     const who = { ...b, sign: true, name: `${b.name} (conditional)` } // these methods all want a signed request
     const call = CONDITIONAL[b.name] === 'v2'
       ? builderCall(who, signer, 'eth_sendBundle', [{ ...base, version: 'v2', desiredState: 'AnyPosition', targetAddresses: w.addresses, targetSlots: w.slots }])
-      : builderCall(who, signer, 'eth_sendEndOfBlockBundle', [{ ...base, targetPools: w.addresses, ...(CONDITIONAL[b.name] === 'eob' ? { targetSlots: w.slots } : {}) }])
+      : builderCall(who, signer, 'eth_sendEndOfBlockBundle', [CONDITIONAL[b.name] === 'eob' ? { ...base, targetPools: w.addresses, targetSlots: w.slots } : { ...base, targetPools: [...w.addresses, ...BUSY_POOLS] }])
     return call.then((r) => ({ ...r, target: Number(t) }))
   }))))
 }
