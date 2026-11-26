@@ -36,6 +36,7 @@ import {
   maxUint256,
   parseAbi,
   parseAbiItem,
+  hexToString,
   parseEther,
   parseGwei,
   parseUnits,
@@ -50,6 +51,7 @@ import { arb2DeployData, planDirect, quoterDeployData, verifyArb2, verifyQuoter 
 import { ARB3_GAS_LIMIT, arb3Abi, arb3DeployData, standingArbData, verifyArb3 } from './arb3.ts'
 import { ARB4_GAS_LIMIT, arb4Abi, arb4DeployData, leanArbData, leanMarket, verifyArb4 } from './arb4.ts'
 import { amountHint, isCandidate, rebuildRaw } from './pending.ts'
+import { probeAbi, probeDeployData, verifyProbe } from './probe.ts'
 
 declare const EdgeRuntime: { waitUntil(p: Promise<unknown>): void } | undefined
 
@@ -500,10 +502,10 @@ const watchTargets = () => ({
   addresses: [ST_USDS, '0x35D1b3F3D7966A1DFe207aa4514C12a259A0492B'],
   slots: [[slot32(1n), slot32(5n)], [slot32(ILK_ART_SLOT), slot32(ILK_ART_SLOT + 3n)]],
 })
-async function sendConditional(signer: PrivateKeyAccount, bundles: Hex[][], targets: bigint[], mayRevert?: Hex[], pick?: Pick) {
+async function sendConditional(signer: PrivateKeyAccount, bundles: Hex[][], targets: bigint[], mayRevert?: Hex[], pick?: Pick, watch?: { addresses: string[]; slots: string[][] }) {
   if (LOCAL_SUBMIT) return []
   const to = BUILDERS.filter((b) => CONDITIONAL[b.name] && (!pick?.only || pick.only.includes(b.name)) && !pick?.except?.includes(b.name))
-  const w = watchTargets()
+  const w = watch ?? watchTargets()
   return await Promise.all(to.flatMap((b) => targets.flatMap((t) => bundles.map((txs) => {
     const base = { txs, blockNumber: toHex(t), ...(mayRevert?.length ? { revertingTxHashes: mayRevert } : {}) }
     const who = { ...b, sign: true, name: `${b.name} (conditional)` } // these methods all want a signed request
@@ -1601,6 +1603,54 @@ async function arbTipMoney(ctx: Ctx, body: any) {
   return out
 }
 
+/**
+ * "Does this builder run our conditional bundles?" with no tokens involved. A conditional bundle holding the probe's
+ * `claim()` is placed with the chosen builders, then the test wallet's `set()` goes to the same builders privately.
+ * `claim()` only works in the block of the `set()`, so the pair landing together is the proof.
+ */
+async function condProbe(ctx: Ctx, body: any) {
+  const k = ctx.keeper!, t = ctx.testOwner!
+  if (body.deploy) {
+    const r = await sendPublic(k, { data: probeDeployData(getAddress(MAIN_WALLET), k.address, t.address), value: parseEther('0.002'), gas: 700_000n })
+    await log(ctx, r.blockNumber, 'cond_probe', { deployed: r.contractAddress, tx: r.transactionHash })
+    return { deployed: r.contractAddress, tx: r.transactionHash }
+  }
+  const probe = await verifyProbe(client as any, getAddress(String(body.address)), getAddress(MAIN_WALLET), k.address, t.address)
+  if (body.withdraw) {
+    const r = await sendPublic(k, { to: probe, data: encodeFunctionData({ abi: probeAbi, functionName: 'withdraw' }), gas: 80_000n })
+    return { returned_to_main_wallet: true, tx: r.transactionHash }
+  }
+  const only = Array.isArray(body.builders) && body.builders.length ? body.builders.map(String) : undefined
+  const blocks = Math.min(Math.max(Number(body.targets ?? 6), 1), 9)
+  const topUp = await ensureGas(ctx, t.address, 1_000_000n)
+  if (topUp) for (let i = 0; i < 60 && (await client.getBlockNumber({ cacheTime: 0 })) < topUp.blockNumber + 2n; i++) await sleep(1000)
+  headCache = null
+  const [n, head] = await Promise.all([client.getTransactionCount({ address: k.address, blockTag: 'latest' }), getHead()])
+  const tip = parseEther(String(body.tip_eth ?? 0.0002))
+  const claim = await signTx(k, { to: probe, data: encodeFunctionData({ abi: probeAbi, functionName: 'claim', args: [tip] }), gas: 120_000n }, Number(ctx.config.arb_priority_gwei ?? 0.05), n)
+  const targets = Array.from({ length: blocks }, (_, i) => head.number + BigInt(i + 1))
+  const cond = await sendConditional(k, [[claim.raw]], targets, undefined, { only }, { addresses: [probe], slots: [[slot32(0n)]] })
+  const accepted = [...new Set(cond.filter(sendOk).map((r: any) => String(r.builder).replace(' (conditional)', '')))]
+  const problems = cond.filter((r: any) => !sendOk(r)).slice(0, 3).map((r: any) => `${r.builder}: ${String(r.body ?? r.error).slice(0, 100)}`)
+  let out: any = { probe, claim_tx: claim.hash, conditional_bundles_accepted_by: accepted, problems, target_blocks: [Number(targets[0]), Number(targets[targets.length - 1])] }
+  try {
+    const s = await sendPrivate(t, { to: probe, data: encodeFunctionData({ abi: probeAbi, functionName: 'set' }), gas: 80_000n }, 2, { only, blocks })
+    const [blk, c] = await Promise.all([client.getBlock({ blockNumber: s.receipt.blockNumber }), client.getTransactionReceipt({ hash: claim.hash }).catch(() => null)])
+    out = {
+      ...out,
+      set: { block: Number(s.receipt.blockNumber), position: s.receipt.transactionIndex, tx: s.receipt.transactionHash },
+      block_built_by: hexToString(blk.extraData).replace(/[^\x20-\x7e]/g, '').trim(),
+      claim: c ? { block: Number(c.blockNumber), position: c.transactionIndex, status: c.status } : 'not included',
+      conditional_bundle_ran: !!c && c.blockNumber === s.receipt.blockNumber && c.status === 'success',
+      ids: cond.filter((r: any) => r.target === Number(s.receipt.blockNumber)).map((r: any) => ({ builder: String(r.builder).replace(' (conditional)', ''), id: /"bundleHash":"(0x[0-9a-f]{64})"/.exec(String(r.body ?? ''))?.[1] ?? null })),
+    }
+  } catch (e) {
+    out.set = `not included: ${String(e).slice(0, 160)}`
+  }
+  await log(ctx, out.set?.block ?? null, 'cond_probe', out)
+  return out
+}
+
 /** Ask a builder what became of one of our bundles (their own tracing method, signed as the sender). */
 async function bundleStats(ctx: Ctx, body: any) {
   const b = BUILDERS.find((x) => x.name === String(body.builder))
@@ -1766,6 +1816,8 @@ Deno.serve(async (req) => {
         return json(await arbTipMoney(ctx, body))
       case 'bundle_stats':
         return json(await bundleStats(ctx, body))
+      case 'cond_probe':
+        return json(await condProbe(ctx, body))
       case 'standing_once': {
         // Fork rehearsals only: hand back the standing bundles for the next block.
         if (!LOCAL_SUBMIT) return json({ error: 'unknown action' }, 400)
