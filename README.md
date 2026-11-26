@@ -153,6 +153,21 @@ Settings (`stusds_alert.exit_config`): `enabled`, `target_name`/`helper_address`
 
 Tests: `cd contracts && forge test` (87 fork tests; `node test/fixtures/build-arb-fixture.mjs` refreshes the Kyber calldata fixture), `deno run --allow-net supabase/functions/stusds-exit/pending_test.ts` (pending-transaction decoder against real transactions).
 
+### Rehearsal of the 25M repayment (26 Nov 2026, fork at block 26500258)
+
+Sky's out-of-schedule spell `0xCFFa0aeA62794b883c20F2463ECdB0E20099106B` sends 25M USDS to the Sky Frontier Foundation at Safe `0xca5183FB9997046fbd9bA8113139bf5a5Af122A0`, the owner of the largest SKY-backed loan (40.2M, engine loan index 1), "to pay down debt". With the main wallet armed on a fork, that Safe repaying 25M was played through version 29 of the bot with a helper configured like the real one (floor 100 USDS, 9e11 wei per USDS, 1 ETH cap):
+
+| Case | Withdrawn to the main wallet | Tip | Route |
+|---|---|---|---|
+| Queued and fully signed, bot key at 0.76 ETH | 1,279,345 USDS (whole position) | 0.754 ETH | Safe route, same block |
+| Same, bot key at 1.06 ETH | 1,279,349 USDS | 0.762 ETH | Safe route, same block |
+| Queued as one plain `wipe` call | 1,279,345 USDS | 0.762 ETH | Safe route, same block |
+| Never queued, seen in the public mempool | 1,279,345 USDS | 0.763 ETH | backrun, same block |
+| Never seen at all | 1,279,345 USDS | 0.761 ETH incl. gas (0.0998%) | standing bundle, same block |
+| Landed without us | 1,279,350 USDS | 0.763 ETH | end of block, next block |
+
+The arb added 84 to 1,608 USDS on a 750,000 USDS purchase. At 0.76 ETH the bot key is left with about 0.005 ETH, and the tip is already capped by the balance, so a lower ETH price would lower the bid; hence the advice to add about 0.3 ETH. A fork plays the builder itself: these runs show the transactions are valid and sized right, not that a builder picks them over a rival's.
+
 ## Dashboard and collector (`supabase/functions/stusds-dash`, `dashboard/`)
 
 `stusds-dash` runs once a minute from pg_cron. It is read-only towards the chain and holds no keys. It stores a snapshot (`stusds_alert.dash_now`), a history row (`dash_history`), new repayments, deposits and withdrawals (`chain_events`), and who took freed liquidity and what they paid the block builder (`takers`). It also keeps the DEX price ladder the bot's arb uses, and sends a Jarvis push (each once) for: a repayment or new borrowing of 100,000 USDS or more, 100,000 or more repaid within an hour, a deposit of 250,000 or more, a rate change, a change of the liquidation switch, the borrowing limit or the deposit cap, SKY falling below $0.035 / $0.03 / $0.025 / $0.02, any change of the main wallet's stUSDS balance, the bot key running low on ETH, and the Safe watch being blind.
