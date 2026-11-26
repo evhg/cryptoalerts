@@ -507,9 +507,10 @@ async function sendConditional(signer: PrivateKeyAccount, bundles: Hex[][], targ
   return await Promise.all(to.flatMap((b) => targets.flatMap((t) => bundles.map((txs) => {
     const base = { txs, blockNumber: toHex(t), ...(mayRevert?.length ? { revertingTxHashes: mayRevert } : {}) }
     const who = { ...b, sign: true, name: `${b.name} (conditional)` } // these methods all want a signed request
-    return CONDITIONAL[b.name] === 'v2'
+    const call = CONDITIONAL[b.name] === 'v2'
       ? builderCall(who, signer, 'eth_sendBundle', [{ ...base, version: 'v2', desiredState: 'AnyPosition', targetAddresses: w.addresses, targetSlots: w.slots }])
       : builderCall(who, signer, 'eth_sendEndOfBlockBundle', [{ ...base, targetPools: w.addresses, targetSlots: w.slots }])
+    return call.then((r) => ({ ...r, target: Number(t) }))
   }))))
 }
 
@@ -1215,6 +1216,12 @@ async function standingLoop(ctx: Ctx, deadline: number) {
               sendConditional(ctx.keeper!, bundles, ahead, mayRevert, pick),
             ])
             res.push(...plain, ...cond)
+            if (cfg.standing_debug) {
+              await log(ctx, Number(head.number), 'standing_sent', {
+                arb: arbLeg?.hash ?? null, tiers: tiers.length, plain_ms: Math.max(...plain.map((r: any) => r.ms ?? 0)),
+                conditional: cond.map((r: any) => ({ builder: String(r.builder).replace(' (conditional)', ''), block: r.target, ms: r.ms, id: /"bundleHash":"(0x[0-9a-f]{64})"/.exec(String(r.body ?? ''))?.[1] ?? String(r.body ?? r.error).slice(0, 80) })),
+              }).catch(() => null)
+            }
             stats.conditional += cond.filter(sendOk).length
             const bad = cond.find((r: any) => !sendOk(r))
             if (bad) stats.conditional_problem = `${(bad as any).builder}: ${String((bad as any).body ?? (bad as any).error).slice(0, 120)}`
@@ -1564,6 +1571,21 @@ async function arbTipMoney(ctx: Ctx, body: any) {
   return out
 }
 
+/** Ask a builder what became of one of our bundles (their own tracing method, signed as the sender). */
+async function bundleStats(ctx: Ctx, body: any) {
+  const b = BUILDERS.find((x) => x.name === String(body.builder))
+  const method = String(body.method ?? `${body.builder}_getBundleStats`)
+  if (!b || !/^[a-z]+_getBundleStats(V2)?$/.test(method)) return { error: 'unknown builder or method' }
+  const param: Record<string, unknown> = { bundleHash: String(body.bundle_hash) }
+  if (body.block) param.blockNumber = toHex(BigInt(body.block))
+  // bombora serves its tracing from a separate host.
+  const url = b.name === 'bombora' ? 'https://stats.bombora.build' : b.url
+  const r = await builderCall({ ...b, url, sign: true }, ctx.keeper!, method, [param], true)
+  let parsed: unknown = r.body
+  try { parsed = JSON.parse(String(r.body)) } catch { /* keep the text */ }
+  return { builder: b.name, method, status: (r as any).status ?? null, reply: parsed }
+}
+
 /** Test wallet only: give it gas money and approve its exit contract. */
 async function approveTest(ctx: Ctx) {
   const t = ctx.testOwner!
@@ -1707,6 +1729,8 @@ Deno.serve(async (req) => {
         return json(await deployArb4(ctx))
       case 'arb_tip_money':
         return json(await arbTipMoney(ctx, body))
+      case 'bundle_stats':
+        return json(await bundleStats(ctx, body))
       case 'standing_once': {
         // Fork rehearsals only: hand back the standing bundles for the next block.
         if (!LOCAL_SUBMIT) return json({ error: 'unknown action' }, 400)
