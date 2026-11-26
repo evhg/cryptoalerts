@@ -129,7 +129,7 @@ async function kyberShares(amountIn: bigint): Promise<bigint | null> {
 }
 
 // Repayments, borrows, deposits and withdrawals in a block range, and who took the liquidity
-// (one row per withdrawing transaction of 100 USDS or more, from block `takersFrom` on).
+// (one row per withdrawing transaction of 5 USDS or more, from block `takersFrom` on).
 async function scan(fromBlock: bigint, toBlock: bigint, takersFrom: bigint) {
   const events: any[] = []
   const takers: any[] = []
@@ -148,9 +148,10 @@ async function scan(fromBlock: bigint, toBlock: bigint, takersFrom: bigint) {
     const ts = new Date(Number((await block(l.blockNumber)).timestamp) * 1000).toISOString()
     events.push({ tx: l.transactionHash, log_index: l.logIndex, block: Number(l.blockNumber), block_ts: ts, kind: l.eventName, who: String(l.args.owner ?? l.args.sender).toLowerCase(), amount: round(amount, 2), txi: l.transactionIndex })
   }
-  const sources = events.filter((e) => (e.kind === 'Wipe' || e.kind === 'Deposit') && e.amount >= 50)
+  const sources = events.filter((e) => (e.kind === 'Wipe' || e.kind === 'Deposit') && e.amount >= 5)
   const byTx = new Map<string, any[]>()
-  for (const e of events) if (e.kind === 'Withdraw' && e.amount >= 100 && BigInt(e.block) >= takersFrom) byTx.set(e.tx, [...(byTx.get(e.tx) ?? []), e])
+  // From 5 USDS up, so the small test deposits and who took them show on the dashboard too.
+  for (const e of events) if (e.kind === 'Withdraw' && e.amount >= 5 && BigInt(e.block) >= takersFrom) byTx.set(e.tx, [...(byTx.get(e.tx) ?? []), e])
   for (const [hash, ws] of byTx) {
     try {
       const [tx, rc, blk] = await Promise.all([client.getTransaction({ hash: hash as Hex }), client.getTransactionReceipt({ hash: hash as Hex }), block(BigInt(ws[0].block))])
