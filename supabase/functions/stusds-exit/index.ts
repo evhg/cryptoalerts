@@ -917,7 +917,11 @@ async function runRoute(ctx: Ctx, o: { route: 'end of block' | 'Safe route' | 'b
     if (!outcome) {
       // Only a loss if somebody else took the liquidity we bid for.
       const left = await availableUsds(client as any).catch(() => null)
-      if (left !== null && left < available / 5n) outcome = 'lost'
+      const ours = cfg.arb4_address
+        ? await client.getLogs({ address: getAddress(cfg.arb4_address), fromBlock: BigInt(o.seenBlock), toBlock: BigInt(o.seenBlock) + 4n }).then((l) => l.length > 0).catch(() => false)
+        : false
+      // Taken by the copy of our own arb that the fast follow or the standing bundle sent: that win is recorded there.
+      if (left !== null && left < available / 5n && !ours) outcome = 'lost'
     }
     if (outcome) {
       const r = await db('stusds_exit_race_result', { p_secret: ctx.secret, p_won: outcome === 'won', p_detail: { route: o.route, tip_share: o.tipShare, opening_usds: formatUnits(available, 18) } }).catch(() => null)
@@ -1180,6 +1184,26 @@ async function standingArbs(ctx: Ctx, nonce: number) {
   return { arb, normal, refunding: high > normal.tip_share ? await make(high) : null }
 }
 
+// The standing transactions for the current block, already signed: a withdrawal per size class and the arb behind it.
+let ready: { head: bigint; at: number; tiers: { raw: Hex; hash: Hex }[]; arb: { raw: Hex; hash: Hex } | null } | null = null
+
+/**
+ * A transaction that may free USDS was just seen in the public queue. Before measuring anything, put the
+ * ready-signed standing transactions behind it and send. They size themselves on-chain, so nothing has to be
+ * computed here: the only time spent is the send. If the transaction frees nothing they fail and are not included.
+ */
+async function fastFollow(ctx: Ctx, victim: any, seenAt: number) {
+  const r = ready
+  if (LOCAL_SUBMIT || !r || Date.now() - r.at > 30_000 || (!r.tiers.length && !r.arb)) return null
+  const raw = rebuildRaw(victim)
+  if (!raw) return null
+  const started = Date.now()
+  const bundles = r.tiers.length ? r.tiers.map((x) => (r.arb ? [raw, x.raw, r.arb.raw] : [raw, x.raw])) : [[raw, r.arb!.raw]]
+  const mayRevert = r.tiers.length && r.arb ? [r.arb.hash] : undefined
+  const sent = await sendBundles(ctx.keeper!, bundles, [r.head + 1n, r.head + 2n], undefined, mayRevert)
+  return { victim: victim.hash, signed_at_block: Number(r.head), bundles: bundles.length, withdrawal_classes: r.tiers.length, arb: r.arb?.hash ?? null, ms_seen_to_sending: started - seenAt, ms_seen_to_sent: Date.now() - seenAt, builders: summarizeSends(sent) }
+}
+
 /** Runs beside the pending-transaction watch: for every new block, put the standing bundles in front of the builders. */
 async function standingLoop(ctx: Ctx, deadline: number) {
   const cfg = ctx.config
@@ -1192,13 +1216,15 @@ async function standingLoop(ctx: Ctx, deadline: number) {
       const head = await getHead()
       if (head.number > last) {
         last = head.number
+        const n = await client.getTransactionCount({ address: ctx.keeper.address, blockTag: 'latest' })
+        const t = cfg.standing_exit === false ? null : await standingTiers(ctx, n)
+        const tiers = t?.tiers ?? []
+        // Behind a withdrawal the arb takes the next nonce, so it can only ever run after it.
+        const a = await standingArbs(ctx, tiers.length ? n + 1 : n).catch((e) => { console.error('standing arb', String(e).slice(0, 160)); return null })
+        // Every run keeps its own signed copy at hand for the fast follow; only the run that claims the block sends.
+        ready = { head: head.number, at: Date.now(), tiers: tiers.map((x) => ({ raw: x.raw, hash: x.hash })), arb: a?.normal ? { raw: a.normal.raw, hash: a.normal.hash } : null }
         if (await claim(ctx, `standing:${head.number}`)) {
           await standingLanded(ctx, head.number).catch((e) => console.error('standing landed check', String(e).slice(0, 120)))
-          const n = await client.getTransactionCount({ address: ctx.keeper.address, blockTag: 'latest' })
-          const t = cfg.standing_exit === false ? null : await standingTiers(ctx, n)
-          const tiers = t?.tiers ?? []
-          // Behind a withdrawal the arb takes the next nonce, so it can only ever run after it.
-          const a = await standingArbs(ctx, tiers.length ? n + 1 : n).catch((e) => { console.error('standing arb', String(e).slice(0, 160)); return null })
           const target = [head.number + 1n]
           // The conditional copies go in for the next few blocks, so one is already with the builder when a slot starts.
           const ahead = Array.from({ length: Math.min(Math.max(Number(cfg.standing_targets ?? 2), 1), 4) }, (_, i) => head.number + BigInt(i + 1))
@@ -1328,9 +1354,13 @@ async function mempoolWatch(ctx: Ctx) {
     const hint = amountHint(tx)
     if (hint !== null && hint < minWad) return // readable and too small to matter
     candidates++
+    // First the ready-signed transactions, at once; the measured, exactly priced bundles follow a few seconds later.
+    const fast = cfg.fast_follow === false ? Promise.resolve(null) : fastFollow(ctx, tx, Date.now()).catch(() => null)
     // One at a time per run: they share the bot key's nonce.
     busy = busy.then(async () => {
+      const f = await fast
       if (!(await claim(ctx, `bk:${tx.hash}`))) return
+      if (f) await log(ctx, f.signed_at_block, 'fast_follow', f).catch(() => null)
       const r = await backrun(ctx, tx).catch((e) => ({ error: String(e).slice(0, 200) }))
       console.log('backrun', tx.hash, JSON.stringify(r).slice(0, 200))
     })
