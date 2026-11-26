@@ -1629,12 +1629,31 @@ async function condProbe(ctx: Ctx, body: any) {
   const tip = parseEther(String(body.tip_eth ?? 0.0002))
   const claim = await signTx(k, { to: probe, data: encodeFunctionData({ abi: probeAbi, functionName: 'claim', args: [tip] }), gas: 120_000n }, Number(ctx.config.arb_priority_gwei ?? 0.05), n)
   const targets = Array.from({ length: blocks }, (_, i) => head.number + BigInt(i + 1))
-  const cond = await sendConditional(k, [[claim.raw]], targets, undefined, { only }, { addresses: [probe], slots: [[slot32(0n)]] })
+  // Which storage the waiting bundle names. Default: the probe's own slot. 'stusds': exactly what the standing
+  // bundles name, to check that list against a real deposit. 'stusds_any': any write to stUSDS.
+  const watch = body.watch === 'stusds' ? watchTargets() : body.watch === 'stusds_any' ? { addresses: [ST_USDS as string], slots: [[] as string[]] } : { addresses: [probe as string], slots: [[slot32(0n)]] }
+  const cond = await sendConditional(k, [[claim.raw]], targets, undefined, { only }, watch)
   const accepted = [...new Set(cond.filter(sendOk).map((r: any) => String(r.builder).replace(' (conditional)', '')))]
   const problems = cond.filter((r: any) => !sendOk(r)).slice(0, 3).map((r: any) => `${r.builder}: ${String(r.body ?? r.error).slice(0, 100)}`)
   let out: any = { probe, claim_tx: claim.hash, conditional_bundles_accepted_by: accepted, problems, target_blocks: [Number(targets[0]), Number(targets[targets.length - 1])] }
   try {
-    const s = await sendPrivate(t, { to: probe, data: encodeFunctionData({ abi: probeAbi, functionName: 'set' }), gas: 80_000n }, 2, { only, blocks })
+    const setReq = { to: probe, data: encodeFunctionData({ abi: probeAbi, functionName: 'set' }), gas: 80_000n }
+    const trigger = Number(body.stusds_trigger_usds ?? 0)
+    let s: { receipt: any }
+    if (trigger > 0) {
+      // The trigger is the pair [set(), a small real deposit into stUSDS] in one private bundle, so the block
+      // writes stUSDS's storage the way any deposit does while `claim()` still depends only on our own flag.
+      const m = await client.getTransactionCount({ address: t.address, blockTag: 'latest' })
+      const a = await signTx(t, setReq, 2, m)
+      const d = await signTx(t, { to: ST_USDS as Hex, data: encodeFunctionData({ abi: tokenAbi, functionName: 'deposit', args: [parseUnits(String(trigger), 18), t.address] }), gas: 450_000n }, 2, m + 1)
+      await sendBundles(t, [[a.raw, d.raw]], targets, undefined, undefined, { only })
+      let rc: any = null
+      for (let i = 0; i < 52 && !rc; i++) { await sleep(2500); rc = await client.getTransactionReceipt({ hash: a.hash }).catch(() => null) }
+      if (!rc) throw new Error('trigger bundle not included in the target blocks')
+      s = { receipt: rc }
+      out.trigger = `set() plus a ${trigger} USDS deposit`
+    } else s = await sendPrivate(t, setReq, 2, { only, blocks })
+    out.watch = body.watch ?? 'probe'
     const [blk, c] = await Promise.all([client.getBlock({ blockNumber: s.receipt.blockNumber }), client.getTransactionReceipt({ hash: claim.hash }).catch(() => null)])
     out = {
       ...out,
