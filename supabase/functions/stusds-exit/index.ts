@@ -488,6 +488,31 @@ async function localCommit(bundle: Hex[]) {
 // Builders that pay back part of an overpaying bid (BuilderNet's refund rule; the Flashbots relay feeds BuilderNet).
 const REFUNDING = ['buildernet', 'flashbots']
 type Pick = { only?: string[]; except?: string[] }
+// Conditional ("end of block") bundles. A builder simulates an ordinary bundle at the start of the block and
+// drops it if it fails there, so a bundle that only works after someone else's transaction never gets a second look.
+// These builders also take bundles that name the contracts they depend on, and try them once a transaction in the
+// block has written to that storage: every deposit or loan repayment writes stUSDS's own bookkeeping (slots 1 and 5),
+// and a repayment also writes the loan type's totals in Sky's ledger.
+const CONDITIONAL: Record<string, 'eob' | 'v2'> = { titan: 'eob', quasar: 'eob', bombora: 'eob', buildernet: 'v2' }
+const slot32 = (n: bigint) => toHex(n, { size: 32 })
+const ILK_ART_SLOT = 0x0b2fb9dcfebfeb5c8f6985ea98125a38a1adb70b7194dc26531c5e9ab986e533n // ilks[LSEV2-SKY-A] in the Vat
+const watchTargets = () => ({
+  addresses: [ST_USDS, '0x35D1b3F3D7966A1DFe207aa4514C12a259A0492B'],
+  slots: [[slot32(1n), slot32(5n)], [slot32(ILK_ART_SLOT), slot32(ILK_ART_SLOT + 3n)]],
+})
+async function sendConditional(signer: PrivateKeyAccount, bundles: Hex[][], targets: bigint[], mayRevert?: Hex[], pick?: Pick) {
+  if (LOCAL_SUBMIT) return []
+  const to = BUILDERS.filter((b) => CONDITIONAL[b.name] && (!pick?.only || pick.only.includes(b.name)) && !pick?.except?.includes(b.name))
+  const w = watchTargets()
+  return await Promise.all(to.flatMap((b) => targets.flatMap((t) => bundles.map((txs) => {
+    const base = { txs, blockNumber: toHex(t), ...(mayRevert?.length ? { revertingTxHashes: mayRevert } : {}) }
+    const who = { ...b, sign: true, name: `${b.name} (conditional)` } // these methods all want a signed request
+    return CONDITIONAL[b.name] === 'v2'
+      ? builderCall(who, signer, 'eth_sendBundle', [{ ...base, version: 'v2', desiredState: 'AnyPosition', targetAddresses: w.addresses, targetSlots: w.slots }])
+      : builderCall(who, signer, 'eth_sendEndOfBlockBundle', [{ ...base, targetPools: w.addresses, targetSlots: w.slots }])
+  }))))
+}
+
 async function sendBundles(signer: PrivateKeyAccount, bundles: Hex[][], targets: bigint[], publicRaw?: Hex, mayRevert?: Hex[], pick?: Pick) {
   const to = BUILDERS.filter((b) => (!pick?.only || pick.only.includes(b.name)) && !pick?.except?.includes(b.name))
   return await Promise.all([
@@ -618,7 +643,8 @@ async function probeLiquidity(ctx: Ctx, preceding: Hex[], n: number): Promise<Pr
   return { ok: true, x, exitExpected, exitSkip, availableAfter }
 }
 
-type Leg = { raw: Hex; hash: Hex; expected: bigint; detail: Record<string, unknown>; alt?: { raw: Hex; hash: Hex; tip_usds: string; tip_share: number } }
+type Leg = { raw: Hex; hash: Hex; expected: bigint; detail: Record<string, unknown>; alt?: { raw: Hex; hash: Hex; tip_usds: string; tip_share: number }; sentEarly?: boolean }
+type Early = (leg: { raw: Hex; hash: Hex }) => Promise<unknown>
 type Skip = { skipped: string; [k: string]: unknown }
 const isLeg = (x: Leg | Skip): x is Leg => 'raw' in x
 
@@ -669,9 +695,9 @@ async function arbLeg(ctx: Ctx, preceding: Hex[], availableWad: bigint, nonce: n
  * The same arb through the direct-routing contract: priced from the Curve pool
  * itself, so it is ready about a second after the liquidity is measured.
  */
-async function directArbLeg(ctx: Ctx, preceding: Hex[], availableWad: bigint, nonce: number, tipShare: number): Promise<Leg | Skip> {
+async function directArbLeg(ctx: Ctx, preceding: Hex[], availableWad: bigint, nonce: number, tipShare: number, early?: Early): Promise<Leg | Skip> {
   const cfg = ctx.config
-  if (cfg.arb_enabled && cfg.arb4_address && ctx.keeper) return await leanArbLeg(ctx, preceding, availableWad, nonce, tipShare)
+  if (cfg.arb_enabled && cfg.arb4_address && ctx.keeper) return await leanArbLeg(ctx, preceding, availableWad, nonce, tipShare, early)
   if (!cfg.arb_enabled || !cfg.arb2_address || !ctx.keeper) return { skipped: 'direct arb off' }
   const minOpening = Number(cfg.arb_min_usds ?? 1000)
   if (availableWad < parseUnits(String(minOpening), 18)) return { skipped: 'too little liquidity for an arb', available_usds: formatUnits(availableWad > 0n ? availableWad : 0n, 18) }
@@ -723,15 +749,18 @@ async function leanArbTx(ctx: Ctx, nonce: number, tipShare: number) {
 }
 
 /** The arb behind a known transaction, through the lean contract. */
-async function leanArbLeg(ctx: Ctx, preceding: Hex[], availableWad: bigint, nonce: number, tipShare: number): Promise<Leg | Skip> {
+async function leanArbLeg(ctx: Ctx, preceding: Hex[], availableWad: bigint, nonce: number, tipShare: number, early?: Early): Promise<Leg | Skip> {
   const cfg = ctx.config
   if (availableWad < parseUnits(String(Number(cfg.arb_min_usds ?? 1000)), 18)) return { skipped: 'too little liquidity for an arb', available_usds: formatUnits(availableWad > 0n ? availableWad : 0n, 18) }
   try {
     const t0 = Date.now()
     const tx = await leanArbTx(ctx, nonce, tipShare)
-    const [sim, tipMoney] = await Promise.all([simulateBundle(ctx, [...preceding, tx.raw]), client.getBalance({ address: tx.arb })])
+    // The contract sizes and checks itself, so there is nothing to wait for: it goes to the builders the moment it
+    // is signed, and the simulation below only tells the log what to expect. A run that would fail is not included.
+    const sending = early ? early(tx).then(() => true, () => false) : Promise.resolve(false)
+    const [sim, tipMoney, sentEarly] = await Promise.all([simulateBundle(ctx, [...preceding, tx.raw]), client.getBalance({ address: tx.arb }), sending])
     const r = sim.results[preceding.length]
-    if (!r || r.error || !r.value) return { skipped: `simulation failed: ${r?.error ?? JSON.stringify(sim.raw ?? 'no result').slice(0, 160)}` }
+    if (!r || r.error || !r.value) return { skipped: `simulation failed: ${r?.error ?? JSON.stringify(sim.raw ?? 'no result').slice(0, 160)}`, sent_anyway: sentEarly }
     const toMain = BigInt(r.value)
     // The USDS profit goes to the main wallet in full; the builder's share is paid in ETH the contract holds.
     const tipUsds = (toMain * BigInt(Math.round(Math.min(tipShare, 0.9995) * 10_000))) / 10_000n
@@ -739,6 +768,7 @@ async function leanArbLeg(ctx: Ctx, preceding: Hex[], availableWad: bigint, nonc
       raw: tx.raw,
       hash: tx.hash,
       expected: 0n,
+      sentEarly,
       detail: {
         hash: tx.hash, nonce, tip_share: tipShare, venue: 'Curve pool, lean contract', net: formatUnits(toMain, 18), quoted_profit: formatUnits(toMain, 18),
         tip_usds: formatUnits(tipUsds, 18), tip_paid_in: 'ETH held by the arb contract', tip_money_eth: formatEther(tipMoney), eth_usd: tx.eth_usd, gas_used: r.gasUsed, plan_ms: Date.now() - t0,
@@ -827,10 +857,19 @@ async function runRoute(ctx: Ctx, o: { route: 'end of block' | 'Safe route' | 'b
   const before = isLeg(exit) ? [...o.preceding, exit.raw] : o.preceding
   const arbNonce = isLeg(exit) ? o.n + 1 : o.n
   // Direct route first: it needs no outside quote and is out within about a second.
+  // Two forms: behind the transactions it follows, and on its own as a conditional bundle. The second is for a
+  // builder that has already placed those transactions: it can still add the arb once they have changed stUSDS.
+  const early: Early | undefined = LOCAL_SUBMIT ? undefined : async (leg) => {
+    const [a, b] = await Promise.all([
+      sendBundles(keeper, [[...before, leg.raw]], targets, undefined, holdExit ? [leg.hash] : undefined, { only: o.onlyBuilders }),
+      before.length ? sendConditional(keeper, [[leg.raw]], targets, undefined, { only: o.onlyBuilders }) : Promise.resolve([]),
+    ])
+    sent.push(...a, ...b)
+  }
   const direct: Leg | Skip = holdExit
-    ? await Promise.race([directArbLeg(ctx, before, available, arbNonce, o.tipShare), sleep(LOCAL_SUBMIT ? 30_000 : 2500).then((): Skip => ({ skipped: 'arb plan took too long' }))])
-    : await directArbLeg(ctx, before, available, arbNonce, o.tipShare)
-  if (isLeg(direct) && !LOCAL_SUBMIT) {
+    ? await Promise.race([directArbLeg(ctx, before, available, arbNonce, o.tipShare, early), sleep(LOCAL_SUBMIT ? 30_000 : 2500).then((): Skip => ({ skipped: 'arb plan took too long' }))])
+    : await directArbLeg(ctx, before, available, arbNonce, o.tipShare, early)
+  if (isLeg(direct) && !LOCAL_SUBMIT && !direct.sentEarly) {
     const alt = direct.alt
     const refunders = REFUNDING.filter((b) => !o.onlyBuilders || o.onlyBuilders.includes(b))
     // Builders that refund overpayment get the higher bid; everyone else gets the normal one. Same nonce: one lands at most.
@@ -1146,7 +1185,7 @@ async function standingLoop(ctx: Ctx, deadline: number) {
   if (!cfg.enabled || !ctx.keeper || LOCAL_SUBMIT) return
   if (cfg.standing_exit === false && (cfg.standing_arb === false || !(cfg.arb3_address || cfg.arb4_address))) return
   let last = 0n
-  const stats = { blocks: 0, bundles: 0, accepted: 0, idle_blocks: 0, position_usds: '0', arb: false }
+  const stats: Record<string, any> = { blocks: 0, bundles: 0, accepted: 0, conditional: 0, idle_blocks: 0, position_usds: '0', arb: false }
   while (Date.now() < deadline - 2000) {
     try {
       const head = await getHead()
@@ -1160,13 +1199,25 @@ async function standingLoop(ctx: Ctx, deadline: number) {
           // Behind a withdrawal the arb takes the next nonce, so it can only ever run after it.
           const a = await standingArbs(ctx, tiers.length ? n + 1 : n).catch((e) => { console.error('standing arb', String(e).slice(0, 160)); return null })
           const target = [head.number + 1n]
+          // The conditional copies go in for the next few blocks, so one is already with the builder when a slot starts.
+          const ahead = Array.from({ length: Math.min(Math.max(Number(cfg.standing_targets ?? 2), 1), 4) }, (_, i) => head.number + BigInt(i + 1))
           const res: any[] = []
           const refunders = a?.refunding ? REFUNDING : []
           const send = async (arbLeg: { raw: Hex; hash: Hex } | null, pick?: Pick) => {
-            if (tiers.length) {
-              // One bundle per size class; the arb rides behind and may fail without holding the withdrawal back.
-              res.push(...await sendBundles(ctx.keeper!, tiers.map((x) => (arbLeg ? [x.raw, arbLeg.raw] : [x.raw])), target, undefined, arbLeg ? [arbLeg.hash] : undefined, pick))
-            } else if (arbLeg) res.push(...await sendBundles(ctx.keeper!, [[arbLeg.raw]], target, undefined, undefined, pick))
+            // One bundle per size class; the arb rides behind and may fail without holding the withdrawal back.
+            const bundles = tiers.length ? tiers.map((x) => (arbLeg ? [x.raw, arbLeg.raw] : [x.raw])) : arbLeg ? [[arbLeg.raw]] : []
+            if (!bundles.length) return
+            const mayRevert = tiers.length && arbLeg ? [arbLeg.hash] : undefined
+            // Ordinary bundle: only works when USDS is already withdrawable at the start of the block (a builder
+            // drops a bundle that fails there). Conditional bundle: tried after something in the block changed stUSDS.
+            const [plain, cond] = await Promise.all([
+              sendBundles(ctx.keeper!, bundles, target, undefined, mayRevert, pick),
+              sendConditional(ctx.keeper!, bundles, ahead, mayRevert, pick),
+            ])
+            res.push(...plain, ...cond)
+            stats.conditional += cond.filter(sendOk).length
+            const bad = cond.find((r: any) => !sendOk(r))
+            if (bad) stats.conditional_problem = `${(bad as any).builder}: ${String((bad as any).body ?? (bad as any).error).slice(0, 120)}`
           }
           if (a?.refunding) await send(a.refunding, { only: refunders })
           await send(a?.normal ?? null, refunders.length ? { except: refunders } : undefined)
@@ -1542,6 +1593,12 @@ async function drill(ctx: Ctx, body: any) {
   // the arb, so nobody can compete. 'race': the deposit is also broadcast publicly, and every bot may follow it.
   if (body.mode === 'alone' || body.mode === 'race') {
     const cfg = ctx.config
+    if (!LOCAL_SUBMIT) {
+      // Start just after a new block, so the test has a whole slot ahead of it like a repayment seen early.
+      const was = (await client.getBlockNumber({ cacheTime: 0 }))
+      for (let i = 0; i < 40 && (await client.getBlockNumber({ cacheTime: 0 })) === was; i++) await sleep(400)
+      headCache = null
+    }
     const [n, head] = await Promise.all([client.getTransactionCount({ address: k.address, blockTag: 'latest' }), getHead()])
     const dep = await signTx(k, req, Number(cfg.priority_gwei ?? 1), n)
     await log(ctx, Number(head.number), 'drill_deposit', { usds: body.usds, mode: body.mode, tx: dep.hash })
