@@ -48,6 +48,7 @@ import { EXIT_CREATION_BYTECODE } from './bytecode.ts'
 import { ARB_GAS_LIMIT, arbDeployData, availableUsds, type Ladder, ladderQuotes, planArb, verifyArb } from './arb.ts'
 import { arb2DeployData, planDirect, quoterDeployData, verifyArb2, verifyQuoter } from './arb2.ts'
 import { ARB3_GAS_LIMIT, arb3Abi, arb3DeployData, standingArbData, verifyArb3 } from './arb3.ts'
+import { ARB4_GAS_LIMIT, arb4Abi, arb4DeployData, leanArbData, leanMarket, verifyArb4 } from './arb4.ts'
 import { amountHint, isCandidate, rebuildRaw } from './pending.ts'
 
 declare const EdgeRuntime: { waitUntil(p: Promise<unknown>): void } | undefined
@@ -670,6 +671,7 @@ async function arbLeg(ctx: Ctx, preceding: Hex[], availableWad: bigint, nonce: n
  */
 async function directArbLeg(ctx: Ctx, preceding: Hex[], availableWad: bigint, nonce: number, tipShare: number): Promise<Leg | Skip> {
   const cfg = ctx.config
+  if (cfg.arb_enabled && cfg.arb4_address && ctx.keeper) return await leanArbLeg(ctx, preceding, availableWad, nonce, tipShare)
   if (!cfg.arb_enabled || !cfg.arb2_address || !ctx.keeper) return { skipped: 'direct arb off' }
   const minOpening = Number(cfg.arb_min_usds ?? 1000)
   if (availableWad < parseUnits(String(minOpening), 18)) return { skipped: 'too little liquidity for an arb', available_usds: formatUnits(availableWad > 0n ? availableWad : 0n, 18) }
@@ -694,6 +696,54 @@ async function directArbLeg(ctx: Ctx, preceding: Hex[], availableWad: bigint, no
     if (!r.raw) return { skipped: r.skipped ?? 'no plan', ...r }
     const { raw, hash, alt, ...rest } = r
     return { raw, hash, alt, expected: 0n, detail: { hash, nonce, tip_share: tipShare, ...rest, ...(alt ? { buildernet_bid: { hash: alt.hash, tip_usds: alt.tip_usds, tip_share: alt.tip_share } } : {}) } }
+  } catch (e) {
+    return { skipped: String(e).slice(0, 200) }
+  }
+}
+
+const nowSec = () => BigInt(Math.floor(Date.now() / 1000))
+
+/** One signed run of the lean arb contract. It sizes itself, so the same call serves every route. */
+async function leanArbTx(ctx: Ctx, nonce: number, tipShare: number) {
+  const cfg = ctx.config
+  const arb = await verifyArb4(client as any, getAddress(cfg.arb4_address), getAddress(MAIN_WALLET), ctx.keeper!.address)
+  const [market, px] = await Promise.all([leanMarket(client as any), ethUsd(nowSec())])
+  const data = leanArbData({
+    minOpeningUsds: Number(cfg.arb_min_usds ?? 1000),
+    maxSpendUsds: Number(cfg.arb_auto_max_spend ?? 400000),
+    tipShare,
+    ethUsd: px,
+    minNetUsds: Number(cfg.arb_min_net_usd ?? 0.2),
+    twoStepFromUsds: Number(cfg.arb_two_step_from ?? 5000),
+    market,
+  })
+  // The builder is paid by the contract from the ETH it holds, so the priority fee stays minimal.
+  const signed = await signTx(ctx.keeper!, { to: arb, data, gas: ARB4_GAS_LIMIT }, Number(cfg.arb_priority_gwei ?? 0.05), nonce)
+  return { arb, raw: signed.raw, hash: signed.hash, tip_share: tipShare, eth_usd: px }
+}
+
+/** The arb behind a known transaction, through the lean contract. */
+async function leanArbLeg(ctx: Ctx, preceding: Hex[], availableWad: bigint, nonce: number, tipShare: number): Promise<Leg | Skip> {
+  const cfg = ctx.config
+  if (availableWad < parseUnits(String(Number(cfg.arb_min_usds ?? 1000)), 18)) return { skipped: 'too little liquidity for an arb', available_usds: formatUnits(availableWad > 0n ? availableWad : 0n, 18) }
+  try {
+    const t0 = Date.now()
+    const tx = await leanArbTx(ctx, nonce, tipShare)
+    const [sim, tipMoney] = await Promise.all([simulateBundle(ctx, [...preceding, tx.raw]), client.getBalance({ address: tx.arb })])
+    const r = sim.results[preceding.length]
+    if (!r || r.error || !r.value) return { skipped: `simulation failed: ${r?.error ?? JSON.stringify(sim.raw ?? 'no result').slice(0, 160)}` }
+    const toMain = BigInt(r.value)
+    // The USDS profit goes to the main wallet in full; the builder's share is paid in ETH the contract holds.
+    const tipUsds = (toMain * BigInt(Math.round(Math.min(tipShare, 0.9995) * 10_000))) / 10_000n
+    return {
+      raw: tx.raw,
+      hash: tx.hash,
+      expected: 0n,
+      detail: {
+        hash: tx.hash, nonce, tip_share: tipShare, venue: 'Curve pool, lean contract', net: formatUnits(toMain, 18), quoted_profit: formatUnits(toMain, 18),
+        tip_usds: formatUnits(tipUsds, 18), tip_paid_in: 'ETH held by the arb contract', tip_money_eth: formatEther(tipMoney), eth_usd: tx.eth_usd, gas_used: r.gasUsed, plan_ms: Date.now() - t0,
+      },
+    }
   } catch (e) {
     return { skipped: String(e).slice(0, 200) }
   }
@@ -724,7 +774,10 @@ async function watchLanding(ctx: Ctx, seenBlock: number, route: string, exit: Le
         )
       } else if (receipt.status === 'success') {
         const won = arbs.find((a) => a.hash === hash)
-        await notify(ctx, 'stusds:arb', `stUSDS arb landed (${route})`, `About ${Number(won?.detail.net ?? 0).toLocaleString('en-US', { maximumFractionDigits: 0 })} USDS profit sent to the main wallet, block ${receipt.blockNumber}. https://etherscan.io/tx/${hash}`)
+        const sentUsds = Number(won?.detail.net ?? 0).toLocaleString('en-US', { maximumFractionDigits: 2 })
+        // The lean contract sends the whole USDS profit on and pays the builder's share in ETH it holds.
+        const what = won?.detail.tip_paid_in ? `${sentUsds} USDS sent to the main wallet; the builder's share (about ${Number(won.detail.tip_usds ?? 0).toFixed(2)} USDS) was paid in ETH from the tip money` : `About ${sentUsds} USDS profit sent to the main wallet`
+        await notify(ctx, 'stusds:arb', `stUSDS arb landed (${route})`, `${what}, block ${receipt.blockNumber}. https://etherscan.io/tx/${hash}`)
       }
     }
   }
@@ -762,7 +815,7 @@ async function runRoute(ctx: Ctx, o: { route: 'end of block' | 'Safe route' | 'b
   // whatever is withdrawable when it runs did exactly that on 25 Nov. So there the arb is planned first (for at most
   // 2.5 s) and travels in the same bundle, marked as allowed to fail so that it can never hold the withdrawal back.
   const exclusive = o.route === 'Safe route' || o.route === 'test, alone'
-  const holdExit = exclusive && isLeg(exit) && !!(cfg.arb_enabled && cfg.arb2_address) && p.availableAfter >= parseUnits(String(cfg.arb_min_usds ?? 1000), 18)
+  const holdExit = exclusive && isLeg(exit) && !!(cfg.arb_enabled && (cfg.arb4_address || cfg.arb2_address)) && p.availableAfter >= parseUnits(String(cfg.arb_min_usds ?? 1000), 18)
   const sendExitAlone = async () => {
     if (isLeg(exit) && !LOCAL_SUBMIT) sent.push(...await sendBundles(keeper, [[...o.preceding, exit.raw]], targets, o.publicCopy && cfg.public_broadcast ? exit.raw : undefined, undefined, { only: o.onlyBuilders }))
   }
@@ -1069,7 +1122,12 @@ async function standingTiers(ctx: Ctx, n: number) {
  */
 async function standingArbs(ctx: Ctx, nonce: number) {
   const cfg = ctx.config
-  if (!cfg.arb_enabled || cfg.standing_arb === false || !cfg.arb3_address || !ctx.keeper) return null
+  if (!cfg.arb_enabled || cfg.standing_arb === false || !(cfg.arb3_address || cfg.arb4_address) || !ctx.keeper) return null
+  if (cfg.arb4_address) {
+    const normal = await leanArbTx(ctx, nonce, Number(cfg.arb_tip_share_race ?? 0.99))
+    const high = Number(cfg.arb_tip_share_buildernet ?? 0)
+    return { arb: normal.arb, normal, refunding: high > normal.tip_share ? await leanArbTx(ctx, nonce, high) : null }
+  }
   const arb = await verifyArb3(client as any, getAddress(cfg.arb3_address), getAddress(MAIN_WALLET), ctx.keeper.address)
   const prio = Number(cfg.arb_priority_gwei ?? 0.05)
   const common = { minOpeningUsds: Number(cfg.arb_min_usds ?? 1000), maxSpendUsds: Number(cfg.arb_auto_max_spend ?? 400000), minNetUsds: Number(cfg.arb_min_net_usd ?? 0.2) }
@@ -1086,7 +1144,7 @@ async function standingArbs(ctx: Ctx, nonce: number) {
 async function standingLoop(ctx: Ctx, deadline: number) {
   const cfg = ctx.config
   if (!cfg.enabled || !ctx.keeper || LOCAL_SUBMIT) return
-  if (cfg.standing_exit === false && (cfg.standing_arb === false || !cfg.arb3_address)) return
+  if (cfg.standing_exit === false && (cfg.standing_arb === false || !(cfg.arb3_address || cfg.arb4_address))) return
   let last = 0n
   const stats = { blocks: 0, bundles: 0, accepted: 0, idle_blocks: 0, position_usds: '0', arb: false }
   while (Date.now() < deadline - 2000) {
@@ -1133,13 +1191,20 @@ async function standingLoop(ctx: Ctx, deadline: number) {
 /** Did a standing bundle land in this block? The contracts' own events say so. */
 async function standingLanded(ctx: Ctx, block: bigint) {
   const cfg = ctx.config
-  if (cfg.arb3_address) {
-    const logs = await client.getLogs({ address: getAddress(cfg.arb3_address), event: arb3Abi.find((x: any) => x.type === 'event' && x.name === 'Arb') as any, fromBlock: block, toBlock: block })
+  const arbs = [cfg.arb4_address, cfg.arb3_address].filter(Boolean).map((a: string) => getAddress(a))
+  if (arbs.length) {
+    const logs = await client.getLogs({ address: arbs, event: arb3Abi.find((x: any) => x.type === 'event' && x.name === 'Arb') as any, fromBlock: block, toBlock: block })
     for (const l of logs as any[]) {
       const net = formatUnits(l.args.net, 18)
-      await log(ctx, block, 'included', { route: 'standing arb', kind: 'arb', hash: l.transactionHash, block: Number(block), index: l.transactionIndex, status: 'success', opening_usds: formatUnits(l.args.available, 18), spent_usds: formatUnits(l.args.spent, 18), net, tip_eth: formatEther(l.args.tipWei) })
-      await notify(ctx, 'stusds:arb', 'stUSDS arb landed (standing bundle)', `About ${Number(net).toLocaleString('en-US', { maximumFractionDigits: 2 })} USDS profit sent to the main wallet from an opening of ${Number(formatUnits(l.args.available, 18)).toLocaleString('en-US', { maximumFractionDigits: 0 })} USDS, block ${block}. https://etherscan.io/tx/${l.transactionHash}`)
-      await db('stusds_exit_race_result', { p_secret: ctx.secret, p_won: true, p_detail: { route: 'standing arb', opening_usds: formatUnits(l.args.available, 18) } }).catch(() => null)
+      const lean = !!cfg.arb4_address && getAddress(l.address) === getAddress(cfg.arb4_address)
+      // The lean contract reports the opening in stUSDS; what was redeemed is the same thing in USDS.
+      const opening = lean ? formatUnits(l.args.redeemed, 18) : formatUnits(l.args.available, 18)
+      // A run this bot sent behind a known transaction is reported by that route, not here.
+      const own = await db('stusds_exit_seen_hash', { p_secret: ctx.secret, p_hash: l.transactionHash }).catch(() => false)
+      if (own === true) continue
+      await log(ctx, block, 'included', { route: 'standing arb', kind: 'arb', hash: l.transactionHash, block: Number(block), index: l.transactionIndex, status: 'success', contract: lean ? 'lean' : 'self-sizing', opening_usds: opening, spent_usds: formatUnits(l.args.spent, 18), net, tip_eth: formatEther(l.args.tipWei) })
+      await notify(ctx, 'stusds:arb', 'stUSDS arb landed (standing bundle)', `About ${Number(net).toLocaleString('en-US', { maximumFractionDigits: 2 })} USDS sent to the main wallet from an opening of ${Number(opening).toLocaleString('en-US', { maximumFractionDigits: 0 })} USDS; the builder was paid ${Number(formatEther(l.args.tipWei)).toFixed(5)} ETH, block ${block}. https://etherscan.io/tx/${l.transactionHash}`)
+      await db('stusds_exit_race_result', { p_secret: ctx.secret, p_won: true, p_detail: { route: 'standing arb', opening_usds: opening } }).catch(() => null)
     }
   }
   if (cfg.helper_address && cfg.standing_exit !== false) {
@@ -1341,6 +1406,15 @@ async function status(ctx: Ctx) {
       max_spend_usds: ctx.config.arb_auto_max_spend ?? 400000,
     }
   }
+  if (ctx.config.arb4_address) {
+    out.arb_lean = {
+      address: ctx.config.arb4_address,
+      code: await verifyArb4(client as any, getAddress(ctx.config.arb4_address), getAddress(MAIN_WALLET), ctx.keeper!.address)
+        .then(() => 'verified: tested build, profit to main wallet, bot key as keeper').catch((e) => `REJECTED: ${String(e)}`),
+      tip_money_eth: formatEther(await client.getBalance({ address: getAddress(ctx.config.arb4_address) })),
+      two_step_from_usds: ctx.config.arb_two_step_from ?? 5000,
+    }
+  }
   out.mempool_watch = !!ctx.config.mempool_enabled
   out.alchemy_feed = !!alchemyKey()
   out.safe_api_key = !!env('SAFE_API_KEY')
@@ -1405,6 +1479,38 @@ async function deployArb3(ctx: Ctx) {
   await verifyArb3(client as any, address, getAddress(MAIN_WALLET), ctx.keeper!.address)
   await log(ctx, receipt.blockNumber, 'deployed_arb3', { address, tx: receipt.transactionHash })
   return { address, tx: receipt.transactionHash, gas_used: receipt.gasUsed }
+}
+
+/** Deploy the lean arb contract (profit fixed to the main wallet, bot key as keeper). */
+async function deployArb4(ctx: Ctx) {
+  const receipt = await sendPublic(ctx.keeper!, { data: arb4DeployData(getAddress(MAIN_WALLET), ctx.keeper!.address), gas: 3_000_000n })
+  const address = receipt.contractAddress!
+  await verifyArb4(client as any, address, getAddress(MAIN_WALLET), ctx.keeper!.address)
+  await log(ctx, receipt.blockNumber, 'deployed_arb4', { address, tx: receipt.transactionHash })
+  return { address, tx: receipt.transactionHash, gas_used: receipt.gasUsed }
+}
+
+/**
+ * The ETH the lean arb contract tips builders with. `add_eth` moves ETH from the bot key into the contract;
+ * `return_eth` sends it on to the main wallet (the contract can pay it nowhere else).
+ */
+async function arbTipMoney(ctx: Ctx, body: any) {
+  const arb = await verifyArb4(client as any, getAddress(ctx.config.arb4_address), getAddress(MAIN_WALLET), ctx.keeper!.address)
+  const out: any = {}
+  if (body.add_eth) {
+    const value = parseEther(String(body.add_eth))
+    if (value > parseEther('0.2')) return { error: 'more than 0.2 ETH at once is refused' }
+    const r = await sendPublic(ctx.keeper!, { to: arb, value, gas: 60_000n })
+    out.added = { eth: String(body.add_eth), tx: r.transactionHash }
+  }
+  if (body.return_eth) {
+    const r = await sendPublic(ctx.keeper!, { to: arb, data: encodeFunctionData({ abi: arb4Abi, functionName: 'withdrawEth', args: [parseEther(String(body.return_eth))] }), gas: 80_000n })
+    out.returned_to_main_wallet = { eth: String(body.return_eth), tx: r.transactionHash }
+  }
+  out.tip_money_eth = formatEther(await client.getBalance({ address: arb }))
+  out.bot_key_eth = formatEther(await client.getBalance({ address: ctx.keeper!.address }))
+  await log(ctx, null, 'arb_tip_money', out)
+  return out
 }
 
 /** Test wallet only: give it gas money and approve its exit contract. */
@@ -1540,6 +1646,10 @@ Deno.serve(async (req) => {
         return json(await deployArb2(ctx))
       case 'deploy_arb3':
         return json(await deployArb3(ctx))
+      case 'deploy_arb4':
+        return json(await deployArb4(ctx))
+      case 'arb_tip_money':
+        return json(await arbTipMoney(ctx, body))
       case 'standing_once': {
         // Fork rehearsals only: hand back the standing bundles for the next block.
         if (!LOCAL_SUBMIT) return json({ error: 'unknown action' }, 400)
