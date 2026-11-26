@@ -276,8 +276,8 @@ async function gasBudget(gas: bigint) {
 async function ensureGas(ctx: Ctx, to: Hex, gas: bigint) {
   const need = await gasBudget(gas)
   const have = await client.getBalance({ address: to })
-  if (have >= need) return
-  await sendPublic(ctx.keeper!, { to, value: need - have + need / 10n, gas: 21_000n })
+  if (have >= need) return null
+  return await sendPublic(ctx.keeper!, { to, value: need - have + need / 10n, gas: 21_000n })
 }
 
 /** Ordinary public transaction (setup steps only - never used for the exit itself). */
@@ -1634,7 +1634,12 @@ async function drill(ctx: Ctx, body: any) {
   const fromTest = body.from === 'test' && !!ctx.testOwner
   if (fromTest && body.mode) return { error: 'a deposit from the test wallet cannot travel in the bot key\'s bundle' }
   const k = fromTest ? ctx.testOwner! : ctx.keeper!
-  if (fromTest) await ensureGas(ctx, k.address, 700_000n)
+  if (fromTest) {
+    // Gas for a handful of test deposits at once. A top-up is a bot-key transaction, which makes the transactions
+    // already signed for this block stale; wait two blocks so the standing bundles are signed afresh before the test.
+    const topUp = await ensureGas(ctx, k.address, 3_000_000n)
+    if (topUp && !LOCAL_SUBMIT) for (let i = 0; i < 60 && (await client.getBlockNumber({ cacheTime: 0 })) < topUp.blockNumber + 2n; i++) await sleep(1000)
+  }
   const amount = parseUnits(String(body.usds), 18)
   const allowance = await client.readContract({ address: USDS, abi: tokenAbi, functionName: 'allowance', args: [k.address, ST_USDS] })
   if (allowance < amount) {
