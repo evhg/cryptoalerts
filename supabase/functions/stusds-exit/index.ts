@@ -495,7 +495,8 @@ type Pick = { only?: string[]; except?: string[] }
 // These builders also take bundles that name the contracts they depend on, and try them once a transaction in the
 // block has written to that storage: every deposit or loan repayment writes stUSDS's own bookkeeping (slots 1 and 5),
 // and a repayment also writes the loan type's totals in Sky's ledger.
-const CONDITIONAL: Record<string, 'eob' | 'v2'> = { titan: 'eob', quasar: 'eob', bombora: 'eob', buildernet: 'v2' }
+// Quasar's version of the method names contracts only; it documents no per-slot field, so none is sent there.
+const CONDITIONAL: Record<string, 'eob' | 'eob_pools' | 'v2'> = { titan: 'eob', quasar: 'eob_pools', bombora: 'eob', buildernet: 'v2' }
 const slot32 = (n: bigint) => toHex(n, { size: 32 })
 const ILK_ART_SLOT = 0x0b2fb9dcfebfeb5c8f6985ea98125a38a1adb70b7194dc26531c5e9ab986e533n // ilks[LSEV2-SKY-A] in the Vat
 const watchTargets = () => ({
@@ -511,7 +512,7 @@ async function sendConditional(signer: PrivateKeyAccount, bundles: Hex[][], targ
     const who = { ...b, sign: true, name: `${b.name} (conditional)` } // these methods all want a signed request
     const call = CONDITIONAL[b.name] === 'v2'
       ? builderCall(who, signer, 'eth_sendBundle', [{ ...base, version: 'v2', desiredState: 'AnyPosition', targetAddresses: w.addresses, targetSlots: w.slots }])
-      : builderCall(who, signer, 'eth_sendEndOfBlockBundle', [{ ...base, targetPools: w.addresses, targetSlots: w.slots }])
+      : builderCall(who, signer, 'eth_sendEndOfBlockBundle', [{ ...base, targetPools: w.addresses, ...(CONDITIONAL[b.name] === 'eob' ? { targetSlots: w.slots } : {}) }])
     return call.then((r) => ({ ...r, target: Number(t) }))
   }))))
 }
