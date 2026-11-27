@@ -181,6 +181,18 @@ Sky's out-of-schedule spell `0xCFFa0aeA62794b883c20F2463ECdB0E20099106B` sends 2
 
 The arb added 84 to 1,608 USDS on a 750,000 USDS purchase. At 0.76 ETH the bot key is left with about 0.005 ETH, and the tip is already capped by the balance, so a lower ETH price would lower the bid; hence the advice to add about 0.3 ETH. A fork plays the builder itself: these runs show the transactions are valid and sized right, not that a builder picks them over a rival's.
 
+## Telegram bot (`supabase/functions/tg-bot`)
+
+A Telegram bot that posts updates into group chats and passes questions to the Claude session that runs this project.
+
+- **Who is who.** The function reads the numeric Telegram user id from each update and looks the role up in `stusds_alert.tg_users`. An owner is made by sending `/claim CODE` to the bot in a private chat, with a one-time code from `stusds_alert.tg_claims`. Everyone else is a guest.
+- **Groups.** Only an owner can add the bot to a group; added by anyone else, it leaves. In a group it only reacts when it is mentioned, replied to, or given `/ask` or `/status` (Telegram's privacy mode stays on, so it does not receive other messages at all).
+- **Limits.** Guests get 8 answers per chat and 4 per person per hour (`stusds_alert.tg_config`). The session is woken at most 25 times an hour.
+- **Waking the session.** The function calls the fire URL of a scheduled task bound to the session (`ROUTINE_FIRE_URL`, `ROUTINE_FIRE_TOKEN`). The call carries no instructions, only a note that messages are waiting; the session reads them from `stusds_alert.v_tg_pending` and answers with `stusds_alert.tg_send`. The rules it follows are in `CLAUDE.md`. If the wake-up fails, the message waits for the hourly check.
+- **Automatic posts.** Database triggers post the utilization alert (`stusds_alert.alerts`) and any repayment of 100,000 USDS or more moving through a watched Safe (`stusds_alert.safe_txs`: queued, fully signed, executed). The session posts the Sky vote milestones itself with `stusds_alert.tg_broadcast`.
+
+Setup: create the bot with BotFather; put its token in the function's secrets as `TELEGRAM_BOT_TOKEN`; add an API trigger to the scheduled task at claude.ai/code/routines and store its URL and token as `ROUTINE_FIRE_URL` and `ROUTINE_FIRE_TOKEN`; then call the function with `{"action":"setup"}` (it reads the bot's name and points Telegram's webhook at itself). `{"action":"status"}` reports what is configured.
+
 ## Dashboard and collector (`supabase/functions/stusds-dash`, `dashboard/`)
 
 `stusds-dash` runs once a minute from pg_cron. It is read-only towards the chain and holds no keys. It stores a snapshot (`stusds_alert.dash_now`), a history row (`dash_history`), new repayments, deposits and withdrawals (`chain_events`), and who took freed liquidity and what they paid the block builder (`takers`). It also keeps the DEX price ladder the bot's arb uses, and sends a Jarvis push (each once) for: a repayment or new borrowing of 100,000 USDS or more, 100,000 or more repaid within an hour, a deposit of 250,000 or more, a rate change, a change of the liquidation switch, the borrowing limit or the deposit cap, SKY falling below $0.035 / $0.03 / $0.025 / $0.02, any change of the main wallet's stUSDS balance, the bot key running low on ETH, and the Safe watch being blind.
