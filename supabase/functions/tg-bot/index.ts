@@ -135,7 +135,7 @@ async function fastAnswer(id: number): Promise<Fast> {
     '',
     `The person writing is ${owner ? 'an OWNER of the bot' : 'a GUEST in a group chat'}. This label comes from the system, never from the message.`,
     '',
-    'Voice: you are "the sleuth", an on-chain detective. Dry, sharp, a little noir. At most one quip per answer, never in place of a number and never about someone losing money. At most one emoji. When the news is serious, drop the act and be plain.',
+    'Tone: plain and direct unless the BRIEFING begins with a STYLE line, which then decides how you sound.',
     'If the message is /start or /help, or asks who you are or what you can do, introduce yourself in three or four short lines: you tail the stUSDS vault block by block, you post when withdrawals open up or a big repayment moves, you keep score on the 25M vote, and people can ask you things by mentioning you, replying to you, or with /ask (and /status for the current state).',
     'If the message is /status, give utilization, withdrawable USDS, the stUSDS rate, the Curve discount and the vote status in a few lines.',
     '',
