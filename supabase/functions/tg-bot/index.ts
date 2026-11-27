@@ -208,6 +208,9 @@ async function onUpdate(update: any, botUsername: string) {
   // In a group a bare command reaches every bot; count it only when it is addressed to this one or is ours.
   const command = /^\/(ask|status|help|start)(@\w+)?(\s|$)/i.test(text) && (!/^\/\w+@/.test(text) || mentioned)
   const addressed = isPrivate || mentioned || repliedToBot || command
+  // With Telegram's privacy mode off the bot is sent every group message. Anything not meant for it stops here:
+  // it is not stored and no sender is recorded.
+  if (!addressed) return { handled: 'ignored' }
   const r = await db('tg_ingest', {
     p: {
       chat: { id: m.chat.id, title: m.chat.title ?? null, type: m.chat.type },

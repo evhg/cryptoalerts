@@ -180,6 +180,12 @@ nothing. This settled every builder question in minutes where real deposits had 
 - The Supabase connector asks the user to confirm migrations that contain `drop`; unanswered, the call times out
   after about four minutes and nothing is applied. Use `create or replace` where possible.
 
+### Telegram bots in groups (27 November)
+
+- With privacy mode on (the default), a bot in a group is sent only commands addressed to it (`/ask@bot`), replies to its own messages and service messages. A message that only `@mentions` the bot is not delivered: the webhook is never called. Tested: a mention in a group produced no request at all, with the webhook healthy and nothing pending.
+- To react to mentions, switch privacy mode off in BotFather (`/setprivacy`, Disable) and remove and re-add the bot, or make it a group admin. The bot is then sent every message, so drop what is not addressed to it before storing anything.
+- Check a delivery assumption with a real message in a real group before writing "mention me" into the bot's texts.
+
 ## 9. Mistakes worth not repeating
 
 | What was said | What was true | Lesson |
