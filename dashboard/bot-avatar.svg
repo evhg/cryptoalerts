@@ -1,0 +1,94 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 640" width="640" height="640">
+  <defs>
+    <radialGradient id="bg" cx="50%" cy="42%" r="75%">
+      <stop offset="0" stop-color="#1a0f2e"/>
+      <stop offset="0.55" stop-color="#0b0714"/>
+      <stop offset="1" stop-color="#050308"/>
+    </radialGradient>
+    <radialGradient id="lens" cx="50%" cy="50%" r="50%">
+      <stop offset="0" stop-color="#19ffb0" stop-opacity="0.22"/>
+      <stop offset="0.7" stop-color="#19ffb0" stop-opacity="0.06"/>
+      <stop offset="1" stop-color="#19ffb0" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="visor" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#ff2bd6"/>
+      <stop offset="0.5" stop-color="#19ffb0"/>
+      <stop offset="1" stop-color="#22d3ff"/>
+    </linearGradient>
+    <filter id="glow" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="7" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <filter id="soft" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="18"/>
+    </filter>
+    <pattern id="hex" width="56" height="97" patternUnits="userSpaceOnUse" patternTransform="translate(0 6)">
+      <path d="M28 0 L56 16 L56 48 L28 65 L0 48 L0 16 Z M28 65 L28 97 M0 48 L-28 65 M56 48 L84 65" fill="none" stroke="#7c5cff" stroke-opacity="0.13" stroke-width="1.5"/>
+    </pattern>
+    <clipPath id="circle"><circle cx="320" cy="320" r="320"/></clipPath>
+  </defs>
+
+  <g clip-path="url(#circle)">
+    <rect width="640" height="640" fill="url(#bg)"/>
+    <rect width="640" height="640" fill="url(#hex)"/>
+
+    <!-- back glow -->
+    <circle cx="320" cy="300" r="190" fill="#7c5cff" opacity="0.28" filter="url(#soft)"/>
+    <circle cx="390" cy="250" r="110" fill="#ff2bd6" opacity="0.16" filter="url(#soft)"/>
+
+    <!-- hooded figure -->
+    <path d="M320 92 C205 92 150 190 146 300 C143 372 120 452 70 560 L70 660 L570 660 L570 560 C520 452 497 372 494 300 C490 190 435 92 320 92 Z" fill="#0d0a16" stroke="#6a4de0" stroke-width="4"/>
+    <path d="M494 300 C490 190 435 92 320 92" fill="none" stroke="#ff2bd6" stroke-width="5" stroke-linecap="round" opacity="0.75" filter="url(#glow)"/>
+    <path d="M146 300 C150 190 205 92 320 92" fill="none" stroke="#22d3ff" stroke-width="4" stroke-linecap="round" opacity="0.55" filter="url(#glow)"/>
+    <!-- hood inner shadow -->
+    <path d="M320 138 C240 138 200 208 198 292 C197 356 214 416 252 452 C280 478 360 478 388 452 C426 416 443 356 442 292 C440 208 400 138 320 138 Z" fill="#050308"/>
+    <!-- hood crease highlights -->
+    <path d="M176 250 C186 170 240 112 320 108" fill="none" stroke="#3a2a66" stroke-width="3" stroke-linecap="round" opacity="0.8"/>
+    <path d="M464 250 C454 170 400 112 320 108" fill="none" stroke="#3a2a66" stroke-width="3" stroke-linecap="round" opacity="0.5"/>
+
+    <!-- glitch offsets of the visor -->
+    <rect x="204" y="246" width="232" height="34" rx="17" fill="#ff2bd6" opacity="0.55" transform="translate(-9 4)"/>
+    <rect x="204" y="246" width="232" height="34" rx="17" fill="#22d3ff" opacity="0.55" transform="translate(9 -4)"/>
+    <!-- visor -->
+    <rect x="204" y="246" width="232" height="34" rx="17" fill="url(#visor)" filter="url(#glow)"/>
+    <rect x="222" y="256" width="196" height="5" rx="2.5" fill="#ffffff" opacity="0.8"/>
+    <!-- glitch slices -->
+    <rect x="180" y="236" width="64" height="6" fill="#19ffb0" opacity="0.95"/>
+    <rect x="404" y="288" width="70" height="6" fill="#ff2bd6" opacity="0.95"/>
+    <rect x="236" y="292" width="40" height="5" fill="#22d3ff" opacity="0.9"/>
+
+    <!-- chain links across the chest -->
+    <g fill="none" stroke="#19ffb0" stroke-width="9" stroke-linecap="round" opacity="0.9" filter="url(#glow)">
+      <rect x="110" y="500" width="92" height="46" rx="23"/>
+      <rect x="188" y="500" width="92" height="46" rx="23" stroke="#22d3ff"/>
+      <rect x="266" y="500" width="76" height="46" rx="23" stroke-dasharray="150 60"/>
+    </g>
+    <!-- the broken link -->
+    <path d="M322 476 L336 452 M300 470 L304 446" stroke="#ff2bd6" stroke-width="7" stroke-linecap="round" filter="url(#glow)"/>
+
+    <!-- magnifier lens over the right side -->
+    <circle cx="436" cy="438" r="88" fill="#07050d"/>
+    <circle cx="436" cy="438" r="88" fill="url(#lens)"/>
+    <circle cx="436" cy="438" r="88" fill="none" stroke="#19ffb0" stroke-width="11" filter="url(#glow)"/>
+    <circle cx="436" cy="438" r="74" fill="none" stroke="#19ffb0" stroke-width="2" opacity="0.5"/>
+    <path d="M500 502 L572 574" stroke="#19ffb0" stroke-width="20" stroke-linecap="round" filter="url(#glow)"/>
+    <path d="M500 502 L572 574" stroke="#0d0a16" stroke-width="7" stroke-linecap="round"/>
+    <!-- what the lens sees: an ether diamond made of data -->
+    <g transform="translate(436 436) scale(0.95)" filter="url(#glow)">
+      <path d="M0 -54 L34 2 L0 22 L-34 2 Z" fill="none" stroke="#e9fff7" stroke-width="5" stroke-linejoin="round"/>
+      <path d="M0 34 L34 12 L0 58 L-34 12 Z" fill="none" stroke="#e9fff7" stroke-width="5" stroke-linejoin="round"/>
+      <path d="M0 -54 L0 22" stroke="#e9fff7" stroke-width="3" opacity="0.7"/>
+    </g>
+    <!-- lens glint -->
+    <path d="M380 392 A70 70 0 0 1 418 368" fill="none" stroke="#ffffff" stroke-width="6" stroke-linecap="round" opacity="0.6"/>
+
+    <!-- scanlines -->
+    <g opacity="0.07" fill="#ffffff">
+      <rect y="40" width="640" height="2"/><rect y="88" width="640" height="2"/><rect y="136" width="640" height="2"/>
+      <rect y="184" width="640" height="2"/><rect y="232" width="640" height="2"/><rect y="280" width="640" height="2"/>
+      <rect y="328" width="640" height="2"/><rect y="376" width="640" height="2"/><rect y="424" width="640" height="2"/>
+      <rect y="472" width="640" height="2"/><rect y="520" width="640" height="2"/><rect y="568" width="640" height="2"/>
+      <rect y="616" width="640" height="2"/>
+    </g>
+  </g>
+</svg>
