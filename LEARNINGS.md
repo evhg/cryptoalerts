@@ -172,8 +172,11 @@ nothing. This settled every builder question in minutes where real deposits had 
   wake-up on. A relay built on that idea failed after six retries over a minute.
 - Tasks created from inside a session cannot be given connectors (the parameter is refused); a task that needs
   Supabase in its fresh sessions has to be created in the web interface.
-- What does reach an existing session in real time: GitHub pull-request events for a PR the session subscribed to.
-  Everything else waits for the next scheduled firing (hourly at the fastest).
+- What does start a turn in an existing session: a background command of its own that ends. A small watcher that
+  long-polls for the event and exits when it happens gives a reaction within seconds (`watcher/tg-wait.mjs`, and
+  the alert watcher before it). This was overlooked at first; three worse options were offered to the owner before
+  their question ("why is there a delay when you are already live?") led to it. GitHub pull-request events for a
+  subscribed PR are the other real-time route. Without either, things wait for the next scheduled firing.
 - The Supabase connector asks the user to confirm migrations that contain `drop`; unanswered, the call times out
   after about four minutes and nothing is applied. Use `create or replace` where possible.
 

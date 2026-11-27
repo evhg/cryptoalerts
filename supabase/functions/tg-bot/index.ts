@@ -120,6 +120,8 @@ async function onUpdate(update: any, botUsername: string) {
     },
   })
   if (r?.action === 'reply' || r?.action === 'queued') await send(m.chat.id, r.text, m.message_id)
+  // 'wait': the session's watcher is listening and will pick the message up within seconds.
+  if (r?.action === 'wait') await tg('sendChatAction', { chat_id: m.chat.id, action: 'typing' })
   if (r?.action === 'fire') {
     await tg('sendChatAction', { chat_id: m.chat.id, action: 'typing' })
     const w = await wake({ source: 'telegram bridge', pending_messages: r.pending, newest_message_id: r.id, sender_role: r.role })
@@ -163,8 +165,27 @@ async function onSession(body: any, begin: any) {
   }
 }
 
+/**
+ * Long poll for the session's own watcher (watcher/tg-wait.mjs): answers as soon as a message is waiting, or after
+ * about 45 seconds with zero. The watcher exits when something is waiting, and that exit is what starts a turn in
+ * the session. Each poll also records that a watcher is listening, so the bot knows an answer will come soon.
+ */
+async function longPoll(key: string) {
+  const until = Date.now() + 45_000
+  for (;;) {
+    const n = await db('tg_poll', { p_key: key })
+    if (n === -1) return json({ error: 'not authorized' }, 401)
+    if (n > 0 || Date.now() >= until) return json({ pending: n })
+    await new Promise((r) => setTimeout(r, 2000))
+  }
+}
+
 Deno.serve(async (req) => {
-  if (req.method !== 'POST') return json({ ok: true })
+  if (req.method !== 'POST') {
+    const key = new URL(req.url).searchParams.get('poll')
+    if (key) return await longPoll(key).catch(() => json({ error: 'internal error' }, 500))
+    return json({ ok: true })
+  }
   try {
     const begin = await db('tg_begin', {
       p_webhook_secret: req.headers.get('x-telegram-bot-api-secret-token') ?? '',
