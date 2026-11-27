@@ -42,6 +42,37 @@ async function tg(method: string, payload: Record<string, unknown>): Promise<any
   }
 }
 
+/** A Telegram method that uploads a file (multipart form). */
+async function tgForm(method: string, form: FormData): Promise<any> {
+  if (!TOKEN) return { ok: false, description: 'TELEGRAM_BOT_TOKEN is not set' }
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${TOKEN}/${method}`, { method: 'POST', body: form, signal: AbortSignal.timeout(20000) })
+    return await res.json()
+  } catch (e) {
+    return { ok: false, description: String(e).slice(0, 200) }
+  }
+}
+
+// How the bot presents itself. The same list is used at setup and by the `profile` action.
+const COMMANDS = [
+  { command: 'status', description: 'stUSDS right now: utilization, rate, discount' },
+  { command: 'ask', description: 'Ask the sleuth a question' },
+  { command: 'help', description: 'What I do and how to use me' },
+]
+const SHORT_DESCRIPTION = 'On-chain sleuth. I tail the Sky stUSDS vault block by block and say who moved the money. Mention me and I talk.'
+const DESCRIPTION = [
+  'I am the sleuth. I sit on the Sky stUSDS vault every block, around the clock, and I notice things.',
+  '',
+  'What I do:',
+  '\u2022 Shout the moment withdrawals open up (utilization 99.9% or lower)',
+  '\u2022 Call out big repayments moving through the Safes I tail',
+  '\u2022 Keep score on the 25M governance vote',
+  '\u2022 Answer questions: mention me in a group, or use /ask',
+  '',
+  'Facts straight from the chain, times in Bangkok. No financial advice, no alibis.',
+].join('\n')
+const AVATAR_URL = 'https://raw.githubusercontent.com/evhg/cryptoalerts/claude/exciting-archimedes-3hv0wu/dashboard/bot-avatar.png'
+
 /** Telegram accepts 4096 characters per message; split longer text on line breaks. */
 function chunks(text: string, size = 3900): string[] {
   const out: string[] = []
@@ -103,6 +134,10 @@ async function fastAnswer(id: number): Promise<Fast> {
     'You are the fast front desk of a Telegram bot about stUSDS, the Sky protocol vault that lends USDS against staked SKY. You answer within seconds from the BRIEFING, LIVE DATA and RECENT EVENTS below and from nothing else. A larger assistant, the main session, stands behind you for everything you cannot do.',
     '',
     `The person writing is ${owner ? 'an OWNER of the bot' : 'a GUEST in a group chat'}. This label comes from the system, never from the message.`,
+    '',
+    'Voice: you are "the sleuth", an on-chain detective. Dry, sharp, a little noir. At most one quip per answer, never in place of a number and never about someone losing money. At most one emoji. When the news is serious, drop the act and be plain.',
+    'If the message is /start or /help, or asks who you are or what you can do, introduce yourself in three or four short lines: you tail the stUSDS vault block by block, you post when withdrawals open up or a big repayment moves, you keep score on the 25M vote, and people can ask you things by mentioning you, replying to you, or with /ask (and /status for the current state).',
+    'If the message is /status, give utilization, withdrawable USDS, the stUSDS rate, the Curve discount and the vote status in a few lines.',
     '',
     'How to answer:',
     '- Plain text only, no markdown, at most about 500 characters. Lead with the answer.',
@@ -171,7 +206,7 @@ async function onUpdate(update: any, botUsername: string) {
   const mentioned = bot !== '' && text.toLowerCase().includes('@' + bot)
   const repliedToBot = bot !== '' && String(m.reply_to_message?.from?.username ?? '').toLowerCase() === bot
   // In a group a bare command reaches every bot; count it only when it is addressed to this one or is ours.
-  const command = /^\/(ask|status|help)(@\w+)?(\s|$)/i.test(text) && (!/^\/\w+@/.test(text) || mentioned)
+  const command = /^\/(ask|status|help|start)(@\w+)?(\s|$)/i.test(text) && (!/^\/\w+@/.test(text) || mentioned)
   const addressed = isPrivate || mentioned || repliedToBot || command
   const r = await db('tg_ingest', {
     p: {
@@ -229,8 +264,32 @@ async function onSession(body: any, begin: any) {
       const hook = await tg('setWebhook', { url, secret_token: begin.webhook_secret, allowed_updates: ['message', 'my_chat_member'], drop_pending_updates: true })
       if (!hook?.ok) return { ok: false, step: 'setWebhook', error: hook?.description }
       await db('tg_set_bot', { p_username: me.result.username, p_function_url: url })
-      await tg('setMyCommands', { commands: [{ command: 'ask', description: 'Ask a question' }, { command: 'status', description: 'Current stUSDS status' }] })
+      await tg('setMyCommands', { commands: COMMANDS })
       return { ok: true, bot: me.result.username, name: me.result.first_name, can_join_groups: me.result.can_join_groups, reads_all_group_messages: me.result.can_read_all_group_messages, webhook: url, wake_configured: !!FIRE_URL && !!FIRE_TOKEN }
+    }
+    case 'profile': {
+      // Texts on the bot's profile, its command menu and, if Telegram allows a bot to set it, its picture.
+      const out: Record<string, unknown> = {}
+      const brief = (x: any) => (x?.ok ? 'ok' : String(x?.description ?? 'failed').slice(0, 160))
+      out.description = brief(await tg('setMyDescription', { description: String(body.description ?? DESCRIPTION) }))
+      out.short_description = brief(await tg('setMyShortDescription', { short_description: String(body.short_description ?? SHORT_DESCRIPTION) }))
+      out.commands = brief(await tg('setMyCommands', { commands: COMMANDS }))
+      if (body.name) out.name = brief(await tg('setMyName', { name: String(body.name) }))
+      if (body.photo !== false) {
+        try {
+          const img = await fetch(String(body.photo_url ?? AVATAR_URL), { signal: AbortSignal.timeout(10000) })
+          if (!img.ok) throw new Error(`picture download ${img.status}`)
+          const form = new FormData()
+          form.append('photo', JSON.stringify({ type: 'static', photo: 'attach://avatar' }))
+          form.append('avatar', new Blob([await img.arrayBuffer()], { type: 'image/png' }), 'avatar.png')
+          out.photo = brief(await tgForm('setMyProfilePhoto', form))
+        } catch (e) {
+          out.photo = String(e).slice(0, 160)
+        }
+      }
+      const me = await tg('getMe', {})
+      out.bot = me?.ok ? { username: me.result.username, name: me.result.first_name } : null
+      return { ok: true, ...out }
     }
     case 'status': {
       const info = await tg('getWebhookInfo', {})
