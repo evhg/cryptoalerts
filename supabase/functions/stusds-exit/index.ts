@@ -1643,7 +1643,13 @@ async function condProbe(ctx: Ctx, body: any) {
   // Which storage the waiting bundle names. Default: the probe's own slot. 'stusds': exactly what the standing
   // bundles name, to check that list against a real deposit. 'stusds_any': any write to stUSDS.
   const watch = body.watch === 'stusds' ? watchTargets() : body.watch === 'stusds_any' ? { addresses: [ST_USDS as string], slots: [[] as string[]] } : { addresses: [probe as string], slots: [[slot32(0n)]] }
-  const cond = await sendConditional(k, [[claim.raw]], targets, undefined, { only }, watch)
+  // `revert_allowed`: instead of a conditional bundle, `claim()` goes out as an ordinary bundle whose one transaction
+  // may revert. Builders without an open conditional method (Quasar, Eureka) then include it in their block whatever
+  // happens; it only does something if the builder placed it behind the `set()`. The probe shows where it lands.
+  const revertAllowed = body.revert_allowed === true
+  const cond = revertAllowed
+    ? (await sendBundles(k, [[claim.raw]], targets, undefined, [claim.hash], { only })).map((r: any, i: number) => ({ ...r, target: Number(targets[i % targets.length]) }))
+    : await sendConditional(k, [[claim.raw]], targets, undefined, { only }, watch)
   const accepted = [...new Set(cond.filter(sendOk).map((r: any) => String(r.builder).replace(' (conditional)', '')))]
   const problems = cond.filter((r: any) => !sendOk(r)).slice(0, 3).map((r: any) => `${r.builder}: ${String(r.body ?? r.error).slice(0, 100)}`)
   let out: any = { probe, claim_tx: claim.hash, conditional_bundles_accepted_by: accepted, problems, target_blocks: [Number(targets[0]), Number(targets[targets.length - 1])] }
@@ -1664,19 +1670,25 @@ async function condProbe(ctx: Ctx, body: any) {
       s = { receipt: rc }
       out.trigger = `set() plus a ${trigger} USDS deposit`
     } else s = await sendPrivate(t, setReq, 2, { only, blocks })
-    out.watch = body.watch ?? 'probe'
+    out.watch = revertAllowed ? 'none: ordinary bundle, claim() allowed to revert' : body.watch ?? 'probe'
     const [blk, c] = await Promise.all([client.getBlock({ blockNumber: s.receipt.blockNumber }), client.getTransactionReceipt({ hash: claim.hash }).catch(() => null)])
     out = {
       ...out,
       set: { block: Number(s.receipt.blockNumber), position: s.receipt.transactionIndex, tx: s.receipt.transactionHash },
       block_built_by: hexToString(blk.extraData).replace(/[^\x20-\x7e]/g, '').trim(),
-      claim: c ? { block: Number(c.blockNumber), position: c.transactionIndex, status: c.status } : 'not included',
+      claim: c ? { block: Number(c.blockNumber), position: c.transactionIndex, status: c.status, gas_used: Number(c.gasUsed), cost_eth: formatEther(c.gasUsed * c.effectiveGasPrice) } : 'not included',
       conditional_bundle_ran: !!c && c.blockNumber === s.receipt.blockNumber && c.status === 'success',
       ids: cond.filter((r: any) => r.target === Number(s.receipt.blockNumber)).map((r: any) => ({ builder: String(r.builder).replace(' (conditional)', ''), id: /"bundleHash":"(0x[0-9a-f]{64})"/.exec(String(r.body ?? ''))?.[1] ?? null })),
     }
   } catch (e) {
     out.set = `not included: ${String(e).slice(0, 160)}`
+    const c = await client.getTransactionReceipt({ hash: claim.hash }).catch(() => null)
+    if (c) {
+      const blk = await client.getBlock({ blockNumber: c.blockNumber })
+      out.claim = { block: Number(c.blockNumber), position: c.transactionIndex, status: c.status, gas_used: Number(c.gasUsed), cost_eth: formatEther(c.gasUsed * c.effectiveGasPrice), block_built_by: hexToString(blk.extraData).replace(/[^\x20-\x7e]/g, '').trim() }
+    }
   }
+  if (revertAllowed) out.bundle_ids = cond.map((r: any) => ({ builder: r.builder, target: r.target, id: /"bundleHash":"(0x[0-9a-f]{64})"/.exec(String(r.body ?? ''))?.[1] ?? null })).slice(0, 18)
   await log(ctx, out.set?.block ?? null, 'cond_probe', out)
   return out
 }
