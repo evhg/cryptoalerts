@@ -153,6 +153,19 @@ Settings (`stusds_alert.exit_config`): `enabled`, `target_name`/`helper_address`
 
 Tests: `cd contracts && forge test` (87 fork tests; `node test/fixtures/build-arb-fixture.mjs` refreshes the Kyber calldata fixture), `deno run --allow-net supabase/functions/stusds-exit/pending_test.ts` (pending-transaction decoder against real transactions).
 
+### Builders that do not run our waiting bundles: the always-in-the-block withdrawal (27 Nov 2026)
+
+On 27 Nov at 01:31 Bangkok time a borrower repaid 33,380 USDS in an Eureka block; an arb bot's transaction sat directly behind it and took it for a 2.07% payment. The bot never saw the repayment (none of its three pending feeds delivered it, including the Alchemy feed filtered to the lending engine, so it was most likely sent privately), and Eureka did not yet run our conditional bundles.
+
+Two things came out of that:
+
+- **Eureka now runs our end-of-block bundles.** Its tracing (`eureka_getBundleStats`, open to everyone; action `bundle_stats` with `builder: "eureka"`) lists our order flow as registered, the method no longer refuses our signer, and the probe landed (block 26503349: `set()` at position 16, `claim()` at 499). Eureka is in `CONDITIONAL` since version 31; a refusal is remembered per worker so a closed method is not asked again.
+- **For Quasar there is a way that needs no special access.** Quasar's and Eureka's ordinary `eth_sendBundle` is open and lets a transaction be listed in `revertingTxHashes`. A bundle of one such transaction is included whatever happens. The builder values it at almost nothing at the start of the block, so it is placed behind better-paying transactions, where a repayment sits; it then withdraws if USDS is withdrawable and reverts if not. Probe runs with `revert_allowed: true`: Eureka block 26502915 (trigger at 9, ours at 82), Quasar blocks 26503190 (14, 15) and 26503196 (19, 94). With `conflict: true` the probe also sends a better-paying `[set(), claim()]` bundle with the same nonce: at Eureka (block 26503321) the better-paying bundle won and the may-revert transaction stayed out; the Quasar run of that check is still to come.
+
+The bot can send the withdrawal this way per builder: `always_builders` (comma-separated, empty = off), `always_priority_gwei` (0.05, the value the probe used), `always_max_fee_gwei` (1: the transaction cannot be included while gas costs more), `always_arb` (the standing arb behind it, the same way). The transaction is `exit(all, smallest size class)` with that class's tip, because here the tip does not decide the place in the block.
+
+Fork rehearsal (block 26503227): a failed attempt uses about 80,000 gas (the arb about 77,000), so it costs about 80,000 x (base fee + 0.05 gwei) in each block of the chosen builders; with the main wallet armed, 33,380 USDS appearing unseen was withdrawn in full for 0.57 USD, and the whole 1.28M position behind an unseen 25M for the same 0.57 USD. A fork plays the builder itself; it cannot show the order a real builder gives ours against a rival doing the same.
+
 ### Rehearsal of the 25M repayment (26 Nov 2026, fork at block 26500258)
 
 Sky's out-of-schedule spell `0xCFFa0aeA62794b883c20F2463ECdB0E20099106B` sends 25M USDS to the Sky Frontier Foundation at Safe `0xca5183FB9997046fbd9bA8113139bf5a5Af122A0`, the owner of the largest SKY-backed loan (40.2M, engine loan index 1), "to pay down debt". With the main wallet armed on a fork, that Safe repaying 25M was played through version 29 of the bot with a helper configured like the real one (floor 100 USDS, 9e11 wei per USDS, 1 ETH cap):
