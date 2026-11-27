@@ -247,13 +247,15 @@ async function getHead(): Promise<Head> {
   return headCache.head
 }
 
-async function signTx(account: PrivateKeyAccount, req: TxReq, priorityGwei: number, nonce?: number) {
+async function signTx(account: PrivateKeyAccount, req: TxReq, priorityGwei: number, nonce?: number, maxFeeGwei?: number) {
   const [head, n] = await Promise.all([
     getHead(),
     nonce === undefined ? client.getTransactionCount({ address: account.address, blockTag: 'pending' }) : Promise.resolve(nonce),
   ])
   const prio = parseGwei(String(priorityGwei))
-  const maxFeePerGas = (head.baseFeePerGas ?? 0n) * 2n + prio
+  // With a cap, the transaction simply cannot be included while gas costs more than the cap.
+  const capped = maxFeeGwei === undefined ? null : parseGwei(String(maxFeeGwei))
+  const maxFeePerGas = capped === null ? (head.baseFeePerGas ?? 0n) * 2n + prio : capped > prio ? capped : prio
   const raw = await account.signTransaction({
     chainId: 1,
     type: 'eip1559',
@@ -506,7 +508,9 @@ const BUSY_POOLS = [
   '0x11b815efB8f581194ae79006d24E0d814B7697F6', // Uniswap v3 WETH/USDT 0.05%
   '0x2C7C98A3b1582D83c43987202aEFf638312478aE', // Curve stUSDS/USDS
 ]
-const CONDITIONAL: Record<string, 'eob' | 'eob_pools' | 'v2'> = { titan: 'eob', quasar: 'eob_pools', bombora: 'eob', buildernet: 'v2' }
+const CONDITIONAL: Record<string, 'eob' | 'eob_pools' | 'v2'> = { titan: 'eob', quasar: 'eob_pools', bombora: 'eob', buildernet: 'v2', eureka: 'eob' }
+// Eureka only serves this method to signers on its list. The first refusal is remembered so the bot stops asking.
+const closedTo = new Set<string>()
 const slot32 = (n: bigint) => toHex(n, { size: 32 })
 const ILK_ART_SLOT = 0x0b2fb9dcfebfeb5c8f6985ea98125a38a1adb70b7194dc26531c5e9ab986e533n // ilks[LSEV2-SKY-A] in the Vat
 const watchTargets = () => ({
@@ -515,7 +519,7 @@ const watchTargets = () => ({
 })
 async function sendConditional(signer: PrivateKeyAccount, bundles: Hex[][], targets: bigint[], mayRevert?: Hex[], pick?: Pick, watch?: { addresses: string[]; slots: string[][] }) {
   if (LOCAL_SUBMIT) return []
-  const to = BUILDERS.filter((b) => CONDITIONAL[b.name] && (!pick?.only || pick.only.includes(b.name)) && !pick?.except?.includes(b.name))
+  const to = BUILDERS.filter((b) => CONDITIONAL[b.name] && !closedTo.has(b.name) && (!pick?.only || pick.only.includes(b.name)) && !pick?.except?.includes(b.name))
   const w = watch ?? watchTargets()
   return await Promise.all(to.flatMap((b) => targets.flatMap((t) => bundles.map((txs) => {
     const base = { txs, blockNumber: toHex(t), ...(mayRevert?.length ? { revertingTxHashes: mayRevert } : {}) }
@@ -523,7 +527,10 @@ async function sendConditional(signer: PrivateKeyAccount, bundles: Hex[][], targ
     const call = CONDITIONAL[b.name] === 'v2'
       ? builderCall(who, signer, 'eth_sendBundle', [{ ...base, version: 'v2', desiredState: 'AnyPosition', targetAddresses: w.addresses, targetSlots: w.slots }])
       : builderCall(who, signer, 'eth_sendEndOfBlockBundle', [CONDITIONAL[b.name] === 'eob' ? { ...base, targetPools: w.addresses, targetSlots: w.slots } : { ...base, targetPools: [...w.addresses, ...BUSY_POOLS] }])
-    return call.then((r) => ({ ...r, target: Number(t) }))
+    return call.then((r) => {
+      if (/access rejected|not available/.test(String((r as any).body ?? ''))) closedTo.add(b.name)
+      return { ...r, target: Number(t) }
+    })
   }))))
 }
 
@@ -1169,7 +1176,38 @@ async function standingTiers(ctx: Ctx, n: number) {
     const signed = await signTx(keeper, { to: helper, data, value: plan.tipWei, gas: STANDING_GAS }, prio, n)
     tiers.push({ raw: signed.raw, hash: signed.hash, min_usds: formatUnits(min, 18), tip_eth: formatEther(plan.tipWei) })
   }
-  return { owner, position_usds: formatUnits(value, 18), tiers }
+  // For the always-in-the-block withdrawal: the smallest amount worth withdrawing and the tip the policy allows for it.
+  const floorPlan = value > base ? await feePlan(cfg, base, EXIT_GAS_USED, balance, STANDING_GAS) : null
+  return { owner, helper, position_usds: formatUnits(value, 18), tiers, floor: floorPlan?.ok ? { min: base, tipWei: floorPlan.tipWei } : null }
+}
+
+/**
+ * The withdrawal for builders whose conditional method does not run our bundles (Quasar, and Eureka without access).
+ *
+ * Their ordinary bundle method is open and lets a transaction be marked "may revert". Such a transaction is included
+ * in the block whatever happens: the builder values it at almost nothing at the start of the block, so it ends up
+ * behind the transactions that pay more, which is where a repayment sits. If USDS is withdrawable when it runs, it
+ * withdraws; if not, it reverts and costs its gas (tested with the probe on 27 Nov 2026: three runs, three times
+ * placed behind the trigger). It is switched on per builder with `always_builders`, carries a low priority fee of
+ * its own, and cannot be included while gas costs more than `always_max_fee_gwei`. The tip is the one for the
+ * smallest size class, because here the tip does not decide the place in the block.
+ */
+async function alwaysBundle(ctx: Ctx, n: number, t: Awaited<ReturnType<typeof standingTiers>>, arb: { raw: Hex; hash: Hex } | null, base: bigint) {
+  const cfg = ctx.config
+  const to = String(cfg.always_builders ?? '').split(',').map((x) => x.trim().toLowerCase()).filter(Boolean)
+  if (!to.length) return null
+  const cap = Number(cfg.always_max_fee_gwei ?? 1), prio = Number(cfg.always_priority_gwei ?? 0.05)
+  // Next block's base fee can be an eighth higher than this one's.
+  if ((base * 9n) / 8n + parseGwei(String(prio)) > parseGwei(String(cap))) return { to, skipped: 'gas above the cap' }
+  const txs: { raw: Hex; hash: Hex }[] = []
+  if (t?.floor) {
+    const data = encodeFunctionData({ abi: exitAbi, functionName: 'exit', args: [maxUint256, t.floor.min] })
+    txs.push(await signTx(ctx.keeper!, { to: t.helper, data, value: t.floor.tipWei, gas: STANDING_GAS }, prio, n, cap))
+  }
+  // The arb was signed for the nonce behind a withdrawal when there is a position, and for this nonce when not.
+  if (cfg.always_arb === true && arb && (txs.length > 0) === !!t?.tiers.length) txs.push(arb)
+  if (!txs.length) return { to, skipped: 'nothing to send' }
+  return { to, txs }
 }
 
 /**
@@ -1267,6 +1305,13 @@ async function standingLoop(ctx: Ctx, deadline: number) {
           }
           if (a?.refunding) await send(a.refunding, { only: refunders })
           await send(a?.normal ?? null, refunders.length ? { except: refunders } : undefined)
+          const always = await alwaysBundle(ctx, n, t, a?.normal ? { raw: a.normal.raw, hash: a.normal.hash } : null, head.baseFeePerGas ?? 0n).catch((e) => { console.error('always bundle', String(e).slice(0, 160)); return null })
+          if (always && 'txs' in always && always.txs) {
+            const sent = await sendBundles(ctx.keeper!, [always.txs.map((x) => x.raw)], target, undefined, always.txs.map((x) => x.hash), { only: always.to })
+            res.push(...sent)
+            stats.always = (stats.always ?? 0) + sent.filter(sendOk).length
+            if (cfg.standing_debug) await log(ctx, Number(head.number), 'standing_sent', { always: always.txs.map((x) => x.hash), to: always.to, ids: sent.map((r: any) => ({ builder: r.builder, id: /"bundleHash":"(0x[0-9a-f]{64})"/.exec(String(r.body ?? ''))?.[1] ?? String(r.body ?? r.error).slice(0, 80) })) }).catch(() => null)
+          } else if (always && 'skipped' in always) stats.always_skipped = always.skipped
           if (!res.length) stats.idle_blocks++
           else {
             stats.blocks++
@@ -1653,6 +1698,32 @@ async function condProbe(ctx: Ctx, body: any) {
   const accepted = [...new Set(cond.filter(sendOk).map((r: any) => String(r.builder).replace(' (conditional)', '')))]
   const problems = cond.filter((r: any) => !sendOk(r)).slice(0, 3).map((r: any) => `${r.builder}: ${String(r.body ?? r.error).slice(0, 100)}`)
   let out: any = { probe, claim_tx: claim.hash, conditional_bundles_accepted_by: accepted, problems, target_blocks: [Number(targets[0]), Number(targets[targets.length - 1])] }
+  if (revertAllowed && body.conflict === true) {
+    // Does the may-revert transaction get in the way of a better-paying bundle of ours that uses the same nonce?
+    // The "real" bundle is [set(), claim() with a larger tip]: valid at the start of the block and worth more.
+    const m = await client.getTransactionCount({ address: t.address, blockTag: 'latest' })
+    const setTx = await signTx(t, { to: probe, data: encodeFunctionData({ abi: probeAbi, functionName: 'set' }), gas: 80_000n }, 2, m)
+    const real = await signTx(k, { to: probe, data: encodeFunctionData({ abi: probeAbi, functionName: 'claim', args: [tip + parseEther('0.0001')] }), gas: 120_000n }, Number(ctx.config.arb_priority_gwei ?? 0.05), n)
+    const sent = await sendBundles(k, [[setTx.raw, real.raw]], targets, undefined, undefined, { only })
+    let ra: any = null, rr: any = null
+    for (let i = 0; i < 52 && !ra && !rr; i++) {
+      await sleep(2500)
+      ;[ra, rr] = await Promise.all([client.getTransactionReceipt({ hash: claim.hash }).catch(() => null), client.getTransactionReceipt({ hash: real.hash }).catch(() => null)])
+    }
+    const landed = rr ?? ra
+    const rs = await client.getTransactionReceipt({ hash: setTx.hash }).catch(() => null)
+    const blk = landed ? await client.getBlock({ blockNumber: landed.blockNumber }) : null
+    out = {
+      ...out, mode: 'conflict: may-revert claim() against a better-paying [set(), claim()] bundle, same nonce', real_bundle_accepted_by: [...new Set(sent.filter(sendOk).map((r: any) => r.builder))], real_tx: real.hash,
+      block: landed ? Number(landed.blockNumber) : null, block_built_by: blk ? hexToString(blk.extraData).replace(/[^\x20-\x7e]/g, '').trim() : null,
+      set: rs ? { block: Number(rs.blockNumber), position: rs.transactionIndex, status: rs.status } : 'not included',
+      real_claim: rr ? { position: rr.transactionIndex, status: rr.status } : 'not included',
+      may_revert_claim: ra ? { position: ra.transactionIndex, status: ra.status, cost_eth: formatEther(BigInt(ra.gasUsed) * BigInt(ra.effectiveGasPrice)) } : 'not included',
+      verdict: rr && rr.status === 'success' ? 'the better-paying bundle won; the may-revert transaction did not get in its way' : ra ? 'the may-revert transaction took the nonce and the better-paying bundle was lost' : 'neither landed (no block from these builders)',
+    }
+    await log(ctx, out.block, 'cond_probe', out)
+    return out
+  }
   try {
     const setReq = { to: probe, data: encodeFunctionData({ abi: probeAbi, functionName: 'set' }), gas: 80_000n }
     const trigger = Number(body.stusds_trigger_usds ?? 0)
@@ -1866,7 +1937,8 @@ Deno.serve(async (req) => {
         const n = await client.getTransactionCount({ address: ctx.keeper!.address, blockTag: 'latest' })
         const t = await standingTiers(ctx, n)
         const a = await standingArbs(ctx, t?.tiers.length ? n + 1 : n)
-        return json({ ...(t ?? { tiers: [], position_usds: '0' }), arb: a })
+        const always = await alwaysBundle(ctx, n, t, a?.normal ? { raw: a.normal.raw, hash: a.normal.hash } : null, (await getHead()).baseFeePerGas ?? 0n)
+        return json({ ...(t ?? { tiers: [], position_usds: '0' }), arb: a, always })
       }
       case 'simcheck':
         return json(await simcheck(ctx))
