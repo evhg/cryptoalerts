@@ -187,7 +187,7 @@ A Telegram bot that posts updates into group chats and passes questions to the C
 
 - **Who is who.** The function reads the numeric Telegram user id from each update and looks the role up in `stusds_alert.tg_users`. An owner is made by sending `/claim CODE` to the bot in a private chat, with a one-time code from `stusds_alert.tg_claims`. Everyone else is a guest.
 - **Groups.** Only an owner can add the bot to a group; added by anyone else, it leaves. In a group it only reacts when it is mentioned, replied to, or given `/ask` or `/status` (Telegram's privacy mode stays on, so it does not receive other messages at all).
-- **Limits.** Guests get 8 answers per chat and 4 per person per hour (`stusds_alert.tg_config`). The session is woken at most 25 times an hour.
+- **Limits.** Guests get 8 answers per chat and 4 per person per hour (`stusds_alert.tg_config`). Questions are answered once an hour, at the session's hourly check; the bot says so when it receives one.
 - **Waking the session.** The session reads waiting messages from `stusds_alert.v_tg_pending` and answers with `stusds_alert.tg_send`; the rules it follows are in `CLAUDE.md`. Today that happens at the hourly check. The function can call a scheduled task's fire URL (`ROUTINE_FIRE_URL`, `ROUTINE_FIRE_TOKEN`), but that turned out to start a fresh session instead of waking the bound one, so it is switched off with `tg_config.fires_per_hour = 0` (see `LEARNINGS.md`).
 - **Automatic posts.** Database triggers post the utilization alert (`stusds_alert.alerts`) and any repayment of 100,000 USDS or more moving through a watched Safe (`stusds_alert.safe_txs`: queued, fully signed, executed). The session posts the Sky vote milestones itself with `stusds_alert.tg_broadcast`.
 

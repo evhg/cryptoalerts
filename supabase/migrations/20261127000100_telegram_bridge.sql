@@ -12,7 +12,7 @@ create table if not exists stusds_alert.tg_config (
   enabled boolean not null default true,
   guest_per_chat_hour int not null default 8,   -- questions from non-owners answered per chat per hour
   guest_per_user_hour int not null default 4,   -- and per person
-  fires_per_hour int not null default 25        -- session wake-ups per hour (the platform allows 30 per task)
+  fires_per_hour int not null default 0         -- outside wake-ups per hour; 0 = off (they start a fresh session, see LEARNINGS.md)
 );
 insert into stusds_alert.tg_config (id) values (1) on conflict (id) do nothing;
 
@@ -183,7 +183,7 @@ begin
 
   select count(*) into v_n from stusds_alert.tg_messages m where m.fired_at > now() - interval '1 hour';
   if v_n >= t.fires_per_hour then
-    return jsonb_build_object('action', 'queued', 'id', v_id, 'text', 'Received. I am at my hourly wake-up limit, so the answer comes with my next hourly check.');
+    return jsonb_build_object('action', 'queued', 'id', v_id, 'text', 'Received. I read messages once an hour, so the answer comes with my next check.');
   end if;
   update stusds_alert.tg_messages set fired_at = now() where id = v_id;
   return jsonb_build_object('action', 'fire', 'id', v_id, 'role', u.role,
