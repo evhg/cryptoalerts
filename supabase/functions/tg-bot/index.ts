@@ -171,13 +171,20 @@ async function fastAnswer(id: number): Promise<Fast> {
   const res = await fetch(`${FAST_URL}/chat/completions`, {
     method: 'POST',
     headers: { authorization: `Bearer ${FAST_KEY}`, 'content-type': 'application/json' },
-    body: JSON.stringify({ model: c.model, max_tokens: 500, temperature: 0.2, messages: [{ role: 'system', content: system }, { role: 'user', content: user }] }),
+    body: JSON.stringify({ model: c.model, max_tokens: 1500, temperature: 0.2, messages: [{ role: 'system', content: system }, { role: 'user', content: user }] }),
     signal: AbortSignal.timeout(9000),
   })
   if (!res.ok) return { kind: 'error', text: `${res.status} ${(await res.text()).slice(0, 160)}` }
   const j = await res.json()
-  const text = String(j?.choices?.[0]?.message?.content ?? '').trim()
-  if (!text) return { kind: 'error', text: 'empty reply' }
+  const choice = j?.choices?.[0]
+  const content = choice?.message?.content
+  // Some gateways return the text as a list of parts instead of one string.
+  const text = (Array.isArray(content) ? content.map((x: any) => (typeof x === 'string' ? x : x?.text ?? '')).join('') : String(content ?? '')).trim()
+  if (!text) {
+    // Say why, so a test shows it: usually the token limit was spent before any visible text was written.
+    const fields = Object.keys(choice?.message ?? {}).join(',')
+    return { kind: 'error', text: `empty reply (finish ${choice?.finish_reason ?? 'unknown'}; fields ${fields}; usage ${JSON.stringify(j?.usage ?? null).slice(0, 120)})` }
+  }
   if (/^\W*HANDOFF\b/i.test(text)) {
     return owner ? { kind: 'handoff', text: 'model asked for the main session' } : { kind: 'answer', text: 'Sorry, that is not something I can help with here.' }
   }
