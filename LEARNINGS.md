@@ -99,6 +99,13 @@ nothing. This settled every builder question in minutes where real deposits had 
   and was not offered on MEV-Share. It was most likely sent through a private route. A better public feed would not
   have shown it.
 - So: more vision helps only for the public part. The durable answer to private flow is section 3.2, not a feed.
+- 27 November 21:14 Bangkok time, the first opening after the end-of-block bundles went live: a new wallet repaid
+  100.03 USDS on the rune.eth Safe's loan (`wipe` on its behalf, block 26507073, Titan). None of the three feeds
+  delivered it, the run logged 0 candidates. A rival arb sat directly behind it and paid the builder about 81% of a
+  2.42 USDS margin. Our end-of-block arb was with Titan for that block at a 99.5% share and got nothing: it is tried
+  after the bundles that carry the freeing transaction, so the better bid did not help. No rebate to the sender is
+  visible, so the route the rival got the transaction by is unknown (public and missed by our feeds, or an order-flow
+  auction).
 - Other pending-feed hosts refused the connection or needed keys. MEV Blocker's searcher stream needs registration.
 
 ## 5. Bidding
