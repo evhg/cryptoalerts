@@ -14,7 +14,7 @@ const TOKEN = env('TELEGRAM_BOT_TOKEN')
 const FIRE_URL = env('ROUTINE_FIRE_URL')
 const FIRE_TOKEN = env('ROUTINE_FIRE_TOKEN')
 // Fast responder: a small model behind an OpenAI-compatible chat endpoint. Without a key the bot simply skips it.
-const FAST_KEY = env('ROTEO_API_KEY')
+const FAST_KEY = env('ROTEO_API_KEY') || env('ROTEO2_KEY')
 const FAST_URL = env('ROTEO_BASE_URL') || 'https://api.roteo.ai/v1'
 
 const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } })
