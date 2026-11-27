@@ -161,6 +161,22 @@ nothing. This settled every builder question in minutes where real deposits had 
 - Arming the main wallet needs about 0.75 ETH on the bot key for a 0.1% tip on the full position at 1,700 USD per
   ETH. The tip is capped by the balance, so a low balance silently lowers the bid.
 
+### Waking a Claude Code cloud session from outside (tested 27 November)
+
+- A scheduled task ("routine") bound to a session wakes that session when it fires on its schedule, or when the
+  session itself calls the `fire_trigger` tool.
+- The task's public API endpoint (`/fire` with a bearer token) does **not** wake the bound session. It always starts
+  a fresh session that runs the task's prompt. Each such run cost about 0.25 USD of usage at list price just to
+  start, and appears as a new session in the list.
+- A fresh session started that way has no `claude-code-remote` tools, so it cannot fire another task to pass the
+  wake-up on. A relay built on that idea failed after six retries over a minute.
+- Tasks created from inside a session cannot be given connectors (the parameter is refused); a task that needs
+  Supabase in its fresh sessions has to be created in the web interface.
+- What does reach an existing session in real time: GitHub pull-request events for a PR the session subscribed to.
+  Everything else waits for the next scheduled firing (hourly at the fastest).
+- The Supabase connector asks the user to confirm migrations that contain `drop`; unanswered, the call times out
+  after about four minutes and nothing is applied. Use `create or replace` where possible.
+
 ## 9. Mistakes worth not repeating
 
 | What was said | What was true | Lesson |
