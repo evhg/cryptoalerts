@@ -215,6 +215,15 @@ nothing. This settled every builder question in minutes where real deposits had 
 - With privacy mode on (the default), a bot in a group is sent only commands addressed to it (`/ask@bot`), replies to its own messages and service messages. A message that only `@mentions` the bot is not delivered: the webhook is never called. Tested: a mention in a group produced no request at all, with the webhook healthy and nothing pending.
 - To react to mentions, switch privacy mode off in BotFather (`/setprivacy`, Disable) and remove and re-add the bot, or make it a group admin. The bot is then sent every message, so drop what is not addressed to it before storing anything.
 - Check a delivery assumption with a real message in a real group before writing "mention me" into the bot's texts.
+- A privacy-mode change only counts in a group after the bot is removed and added again (or made an admin). Only an
+  admin can remove a bot; the bot can leave by itself (`leaveChat`) and an owner adds it back. Seen 28 November: 17
+  hours of silence with a healthy webhook.
+- Bots are not sent each other's messages, so one bot cannot drive another. Write the command for a person to send.
+- Telegram cuts a text over 4096 characters into several messages and only the first carries the mention. On 28
+  November a pasted text of about 6,000 characters addressed to the bot was dropped as not addressed, with no error;
+  the function now adds a following part to the addressed one and logs (without content) when it drops a long
+  message, so the next case shows why.
+- A message that says "summarise this" about a photo, voice note or forward arrives with no text to work on.
 
 ## 9. Mistakes worth not repeating
 

@@ -221,7 +221,14 @@ async function onUpdate(update: any, botUsername: string) {
   const addressed = isPrivate || mentioned || repliedToBot || command
   // With Telegram's privacy mode off the bot is sent every group message. Anything not meant for it stops here:
   // it is not stored and no sender is recorded.
-  if (!addressed) return { handled: 'ignored' }
+  if (!addressed) {
+    // Telegram cuts a long text into parts of up to 4096 characters and only the first carries the mention. A part
+    // that follows an addressed message from the same person within a few seconds is added to it.
+    const joined = text.length >= 200 ? await db('tg_append', { p: { chat_id: m.chat.id, user_id: m.from.id, text } }).catch(() => false) : false
+    // No content in the log, only what is needed to see why a long message was dropped.
+    if (!joined && text.length >= 1000) console.log('long group message dropped', JSON.stringify({ len: text.length, has_at: text.includes('@'), reply: !!m.reply_to_message, fields: Object.keys(m).join(',') }))
+    return { handled: joined ? 'appended' : 'ignored' }
+  }
   const r = await db('tg_ingest', {
     p: {
       chat: { id: m.chat.id, title: m.chat.title ?? null, type: m.chat.type },
