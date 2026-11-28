@@ -130,6 +130,8 @@ async function fastAnswer(id: number): Promise<Fast> {
   const c = await db('tg_fast_context', { p_id: id })
   if (!c) return { kind: 'error', text: 'no context' }
   const owner = c.role === 'owner'
+  // In a group an owner has opened for questions, a guest's question may also go to the main session.
+  const guestQuestions = !owner && !!c.guest_questions
   const system = [
     'You are the fast front desk of a Telegram bot about stUSDS, the Sky protocol vault that lends USDS against staked SKY. You answer within seconds from the BRIEFING, LIVE DATA and RECENT EVENTS below and from nothing else. A larger assistant, the main session, stands behind you for everything you cannot do.',
     '',
@@ -149,7 +151,9 @@ async function fastAnswer(id: number): Promise<Fast> {
     '',
     owner
       ? 'When not to answer: if the owner gives an instruction (do, change, run, test, deploy, arm, switch, send, post, remind), asks about private details (their position, wallets, balances, settings, costs, what the bot did and why), refers to earlier work you have no record of, or asks anything you cannot fully answer from below, reply with the single word HANDOFF and nothing else. The main session then answers in about 20 seconds.'
-      : 'When not to answer: if the guest asks for something you cannot answer from below, for anything private, or wants something changed or done, say so in one polite line. Never write HANDOFF for a guest.',
+      : guestQuestions
+        ? 'When not to answer: if the guest asks a genuine question that you cannot fully answer from below (markets, news, how something works, anything that needs looking up), reply with the single word HANDOFF and nothing else. The main session then looks it up and answers in about 20 seconds. If the guest asks for anything private, or wants something changed, run, set up, logged in to or done, do not write HANDOFF: decline in one polite line.'
+        : 'When not to answer: if the guest asks for something you cannot answer from below, for anything private, or wants something changed or done, say so in one polite line. Never write HANDOFF for a guest.',
     '',
     `NOW: ${c.now_bkk} Bangkok time`,
     '',
@@ -186,7 +190,7 @@ async function fastAnswer(id: number): Promise<Fast> {
     return { kind: 'error', text: `empty reply (finish ${choice?.finish_reason ?? 'unknown'}; fields ${fields}; usage ${JSON.stringify(j?.usage ?? null).slice(0, 120)})` }
   }
   if (/^\W*HANDOFF\b/i.test(text)) {
-    return owner ? { kind: 'handoff', text: 'model asked for the main session' } : { kind: 'answer', text: 'Sorry, that is not something I can help with here.' }
+    return owner || guestQuestions ? { kind: 'handoff', text: 'model asked for the main session' } : { kind: 'answer', text: 'Sorry, that is not something I can help with here.' }
   }
   return { kind: 'answer', text }
 }
