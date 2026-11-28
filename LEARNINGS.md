@@ -239,6 +239,19 @@ nothing. This settled every builder question in minutes where real deposits had 
   message, so the next case shows why.
 - A message that says "summarise this" about a photo, voice note or forward arrives with no text to work on.
 
+### Market data and alerts (28 November)
+
+- Reachable from the Supabase edge functions: OKX (`/api/v5/market/ticker`, `/market/candles`), Hyperliquid
+  (`POST /info`), Kraken and Coinbase. Bybit answers 403 there and Binance 451 from the session container.
+- OKX candles come newest first and the newest one is still open (`confirm` "0"); indicators are computed on closed
+  candles only. `bar=1Dutc` gives UTC days (close 07:00 Bangkok time); plain `1D` is the Hong Kong day. At most 300
+  candles per request, so an average longer than 250 periods is refused.
+- The model never sets an alert. It may only translate a request into a fixed `ALERT …` line; code parses it, checks the
+  coin and the level against live data, and writes the reply. Who may set one is decided in the database from the stored
+  message row.
+- An alert is claimed in the database before it is posted, so two overlapping rounds cannot post it twice; a failed post
+  puts it back.
+
 ## 9. Mistakes worth not repeating
 
 | What was said | What was true | Lesson |

@@ -196,6 +196,36 @@ A Telegram bot that posts updates into group chats and passes questions to the C
 
 Setup: create the bot with BotFather; put its token in the function's secrets as `TELEGRAM_BOT_TOKEN`; add an API trigger to the scheduled task at claude.ai/code/routines and store its URL and token as `ROUTINE_FIRE_URL` and `ROUTINE_FIRE_TOKEN`; then call the function with `{"action":"setup"}` (it reads the bot's name and points Telegram's webhook at itself). `{"action":"status"}` reports what is configured and whether Telegram sends the bot every group message (privacy mode off); with a `chat_id` it also says whether the bot is still a member of that chat. A group where the bot is a plain member and privacy mode was switched off later still delivers nothing but commands and replies until the bot is removed and added again or made an admin (seen 28 Nov: no webhook call for 17 hours with everything else healthy). A group can be opened for guest questions with `select stusds_alert.tg_guest_questions('<title or chat id>', true)` (migration `20261128000100`): there a guest question the fast responder cannot answer is handed to the session, which looks it up; requests to change, run or reveal anything are still declined at the front desk and by the session (rules in `CLAUDE.md`). A group can carry its own hourly limits for guests with `select stusds_alert.tg_group_limits('<title or chat id>', <per chat>, <per person>)` (migration `20261128000200`; null falls back to the general numbers in `tg_config`). What reaches the main session from guests has its own hourly limit per group: `select stusds_alert.tg_group_session_limit('<title or chat id>', <per hour>)` (migration `20261128000300`; counted in `tg_guest_handoff`, checked by the function before it hands a guest message on). `{"action":"poll","chat_id":…,"question":…,"options":[…],"multiple":true}` posts a native poll (open votes unless `"anonymous":true`) and `{"action":"poll_stop","chat_id":…,"message_id":…}` closes it and returns the counts. `{"action":"leave","chat_id":…}` makes the bot walk out of a chat itself, for when nobody present is an admin and can remove it; an owner then adds it again.
 
+### Price and indicator alerts (28 Nov 2026)
+
+Anyone who may set one writes `/alert …` or asks in plain words; the bot stores a rule and posts in that chat when it
+comes true. An alert fires once and lasts 90 days.
+
+| Says | Means |
+|---|---|
+| `/alert BTC below 58500` | the price trades there (checked once a minute on the last price and on the highs and lows of the one-minute candles since the alert was set) |
+| `/alert BTC close 4h below 58500` | a 4h candle closes there |
+| `/alert ETH rsi 4h below 30` | RSI(14) at a 4h close; `rsi21` or `period 21` for another length |
+| `/alert BTC sma 200 1d below` | a daily close under the 200-day average (`ema` works the same) |
+| `/alerts`, `/alert del 3` | list one's own, remove one |
+
+Candles are 15m, 1h, 4h and 1d; the daily candle is the UTC day, so it closes at 07:00 Bangkok time. Prices are OKX spot
+against USDT, with Hyperliquid asked when OKX does not answer or does not list the coin. An alert whose condition is
+already true is refused with the current number.
+
+How it is built: `supabase/functions/tg-bot/alerts.ts` holds the parser, the indicator maths and the checker. A direct
+command is read by code with no model involved. A request in plain words goes to the fast responder, which may only
+translate it into `ALERT …` lines in a fixed form; code parses, checks and answers those. The job `tg-alerts-tick` calls
+the function with `{"action":"alerts_tick"}` once a minute while at least one alert is active. A candle rule is looked at
+once per candle (`checked_slot`). A rule that comes true is first claimed in the database (`tg_alert_fire`), then posted
+as a reply to the message that asked for it; if Telegram refuses the post the alert goes back for the next round.
+
+Who may set one is decided in the database from the stored message (`tg_alert_add`): an owner anywhere, a guest only in
+a group opened for questions. Limits live in `tg_config`: `alerts_per_user` (10 running alerts per guest) and
+`alerts_per_chat` (100). `select * from stusds_alert.v_tg_alerts` shows every alert with its last check and value in
+Bangkok time. `{"action":"alert_test","id":<tg_messages id>,"words":"BTC below 58500"}` runs a command as if that stored
+message had asked, and `{"action":"commands"}` refreshes the command menu.
+
 ## Dashboard and collector (`supabase/functions/stusds-dash`, `dashboard/`)
 
 `stusds-dash` runs once a minute from pg_cron. It is read-only towards the chain and holds no keys. It stores a snapshot (`stusds_alert.dash_now`), a history row (`dash_history`), new repayments, deposits and withdrawals (`chain_events`), and who took freed liquidity and what they paid the block builder (`takers`). It also keeps the DEX price ladder the bot's arb uses, and sends a Jarvis push (each once) for: a repayment or new borrowing of 100,000 USDS or more, 100,000 or more repaid within an hour, a deposit of 250,000 or more, a rate change, a change of the liquidation switch, the borrowing limit or the deposit cap, SKY falling below $0.035 / $0.03 / $0.025 / $0.02, any change of the main wallet's stUSDS balance, the bot key running low on ETH, and the Safe watch being blind.
