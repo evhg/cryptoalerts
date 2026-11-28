@@ -124,6 +124,11 @@ nothing. This settled every builder question in minutes where real deposits had 
   - The other two (30,001 USDS on 23 November, 33,380 on 27 November 01:31) show no refund in the block. Route unknown.
   - Consequence: for that flow the race is decided inside the auction, before any builder ranks our conditional
     bundle. The way in is to become a bidder there (MEV Blocker, Blink, bloXroute BackRunMe each need a sign-up).
+  - How each sign-up works (checked 28 November): Blink has a self-serve Searcher Hub (`searcher.blinklabs.xyz`) that
+    asks for a legal name, country and an identity check with a document and a face scan, so the owner has to do it in
+    person. MEV Blocker gives API keys only through its Telegram support channel (`t.me/mevblocker`). bloXroute
+    enrols by request (`hello@bloxroute.com`; sent 28 November). Titan can only be asked on Discord, Eureka on
+    Telegram.
 - Other pending-feed hosts refused the connection or needed keys. MEV Blocker's searcher stream needs registration.
 
 ## 5. Bidding
