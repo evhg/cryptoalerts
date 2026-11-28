@@ -180,6 +180,20 @@ nothing. This settled every builder question in minutes where real deposits had 
   its result.
 - **Edge function uploads must be byte-exact and verified.** Upload, fetch back, `cmp` and compare sha256. The tool
   layer decodes a JSON escape like backslash-u-2026 into the character, so avoid such escapes in source files.
+- **Better: deploy a pinned commit, not a copy.** Since 28 November `stusds-exit` and `tg-bot` are three-line
+  functions that import their `index.ts` from this repository on GitHub at one full commit hash
+  (`supabase/deploy/README.md`). What runs is exactly what was pushed, a release is a one-line change, and so is going
+  back. Try a version first under the name `stusds-exit-canary` and compare its `status` with the live one.
+- **Safe's transaction service has monthly allowances.** With our key ("Builder plan") 50,000 requests a month;
+  without a key about 5,000 in 30 days per calling address, for all Safes together. Polling two Safes every 10
+  seconds used the key's month up in about three days: from 28 November 11:04 Bangkok time every answer was 429 and
+  the Safe watch was blind for over six hours, noticed only because the function logs it once an hour. Now: the
+  default pace is one request per Safe every 110 seconds (`safe_poll_seconds`, about 47,000 a month); if the key is
+  refused the function asks without a key every 20 minutes (`safe_keyless_seconds`) and serves the stored answer
+  in between. Switch to fast polling only for the days that matter, and back afterwards.
+- Safe's web-app gateway (`safe-client.safe.global`) answers 403 from the edge functions. Not a source.
+- **Check the checks.** The hourly keep-alive looked at the alert watcher and the flows but not at
+  `safe_poll_failed`. A part that can fail silently needs its own line in the routine check.
 - **Read the confirmation, not the response.** Builders answer "accepted" for bundles they will never run. Only an
   on-chain result or the builder's tracing counts.
 - A test wallet's gas top-up from the bot key changes the bot key's nonce. Top up well before a test and wait two

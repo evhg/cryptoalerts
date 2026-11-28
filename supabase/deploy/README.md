@@ -1,4 +1,4 @@
-# How the exit bot is deployed
+# How the exit bot and the Telegram bot are deployed
 
 The function `stusds-exit` on Supabase is a three-line file that imports this repository's
 `supabase/functions/stusds-exit/index.ts` from GitHub at one pinned commit:
@@ -20,6 +20,9 @@ To release:
 
 The repository must stay publicly readable for a deploy to work. A running version does not fetch anything:
 the code is bundled when it is deployed.
+
+The Telegram bot `tg-bot` is deployed the same way from `supabase/functions/tg-bot/index.ts`; check it afterwards
+with its `{"action":"status"}`.
 
 History: first used on 28 November 2026 (version 35). The code before that day's change is commit
 `97c98349ec6c2b93b4b99ec65c7453a37e7d887c`.
