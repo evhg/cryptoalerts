@@ -337,6 +337,21 @@ async function onSession(body: any, begin: any) {
       const r = await tg('leaveChat', { chat_id: Number(body.chat_id) })
       return { ok: !!r?.ok, error: r?.ok ? null : r?.description ?? 'no answer' }
     }
+    case 'poll': {
+      // A native Telegram poll. Votes are open (not anonymous) unless asked otherwise; several answers if `multiple`.
+      const options = (Array.isArray(body.options) ? body.options : []).slice(0, 10).map((x: unknown) => ({ text: String(x).slice(0, 100) }))
+      const r = await tg('sendPoll', {
+        chat_id: Number(body.chat_id), question: String(body.question ?? '').slice(0, 300), options,
+        is_anonymous: body.anonymous === true, allows_multiple_answers: !!body.multiple,
+      })
+      return { ok: !!r?.ok, message_id: r?.result?.message_id ?? null, error: r?.ok ? null : r?.description ?? 'no answer' }
+    }
+    case 'poll_stop': {
+      // Close a poll this bot sent and read the final counts.
+      const r = await tg('stopPoll', { chat_id: Number(body.chat_id), message_id: Number(body.message_id) })
+      if (!r?.ok) return { ok: false, error: r?.description ?? 'no answer' }
+      return { ok: true, voters: r.result.total_voter_count, options: r.result.options.map((o: any) => ({ text: o.text, votes: o.voter_count })) }
+    }
     case 'fast_test': {
       // What would the fast responder say to stored message `id`? Nothing is sent to Telegram.
       const started = Date.now()
