@@ -1041,22 +1041,56 @@ async function safeRoute(ctx: Ctx, safe: Hex, t: any, onchainNonce: bigint, thre
 }
 
 /**
- * The Safe's recent transactions from Safe's transaction service. Without an
- * API key the service allows about 5,000 requests a month per address, so the
- * database function paces itself and serves its last answer in between. With
- * SAFE_API_KEY set, the function asks Safe directly at `safe_poll_seconds`.
+ * The Safe's recent transactions from Safe's transaction service, by the best
+ * way that currently works:
+ * 1. with SAFE_API_KEY, directly and as often as `safe_poll_seconds` says;
+ * 2. if the key is refused (on 28 November: "Monthly quota exceeded"), without
+ *    a key from here. That allows about 5,000 requests in 30 days for all Safes
+ *    together, so it is asked once per `safe_keyless_seconds` for each Safe and
+ *    the answer is kept in the database;
+ * 3. the answer kept in the database, which the database function also
+ *    refreshes itself at its own pace when nothing else has.
  */
 const SAFE_API = 'https://api.safe.global/tx-service/eth/api/v1'
+let safeKeyRestUntil = 0
 async function safeTxList(ctx: Ctx, safe: Hex) {
+  const url = `${SAFE_API}/safes/${safe}/multisig-transactions/?limit=12`
   const key = env('SAFE_API_KEY')
-  if (key) {
-    const r = await fetch(`${SAFE_API}/safes/${safe}/multisig-transactions/?limit=12`, { headers: { authorization: `Bearer ${key}` }, signal: AbortSignal.timeout(8000) })
-    if (!r.ok) throw new Error(`Safe API (with key) answered ${r.status}`)
-    return await r.json()
+  const notes: string[] = []
+  if (key && Date.now() >= safeKeyRestUntil) {
+    try {
+      const r = await fetch(url, { headers: { authorization: `Bearer ${key}` }, signal: AbortSignal.timeout(8000) })
+      if (r.ok) return await r.json()
+      notes.push(`with key ${r.status} ${(await r.text()).slice(0, 80).trim()}`)
+      // A refusal for quota or access does not change within minutes: leave the key alone for a while.
+      if ([401, 403, 429].includes(r.status)) safeKeyRestUntil = Date.now() + 10 * 60_000
+    } catch (e) {
+      notes.push(`with key ${String(e).slice(0, 80)}`)
+    }
+  }
+  // One request per Safe and slot, whichever run gets there first; a missed slot is covered by the stored answer.
+  const pace = Math.max(300, Number(ctx.config.safe_keyless_seconds ?? 1200)) * 1000
+  const slot = Math.floor(Date.now() / pace)
+  if (await claim(ctx, `safe_keyless:${safe}:${slot}`)) {
+    try {
+      const r = await fetch(url, { signal: AbortSignal.timeout(8000) })
+      const body = r.ok ? await r.json() : null
+      await db('stusds_exit_safe_store', {
+        p_secret: ctx.secret, p_safe: safe, p_status: r.status, p_body: body,
+        p_remaining: Number(r.headers.get('x-ratelimit-remaining') ?? -1), p_reset: Number(r.headers.get('x-ratelimit-reset') ?? 0),
+      })
+      if (body) {
+        if (notes.length && (await claim(ctx, `safe_key_refused:${Math.floor(Date.now() / 3_600_000)}`))) await log(ctx, null, 'safe_key_refused', { note: notes[0], using: 'requests without a key' })
+        return body
+      }
+      notes.push(`without key ${r.status}`)
+    } catch (e) {
+      notes.push(`without key ${String(e).slice(0, 80)}`)
+    }
   }
   const viaDb = await db('stusds_exit_safe_fetch', { p_secret: ctx.secret, p_safe: safe, p_limit: 12 })
   if (viaDb?.status === 200 && viaDb.body) return viaDb.body
-  throw new Error(`Safe API without a key: ${viaDb?.status ?? '?'} ${viaDb?.error ?? ''}`.trim())
+  throw new Error(`Safe API: ${[...notes, `stored answer ${viaDb?.status ?? '?'} ${viaDb?.error ?? ''}`.trim()].join('; ')}`.slice(0, 280))
 }
 
 const watchedSafes = (cfg: any): Hex[] =>
