@@ -246,6 +246,13 @@ async function onUpdate(update: any, botUsername: string) {
       await db('tg_fast_done', { p_id: r.id, p_text: f.text })
       return { handled: 'message', action: 'fast' }
     }
+    // A guest's question for the main session counts against the group's own hourly limit for those.
+    if (f.kind === 'handoff' && r.role !== 'owner' && !(await db('tg_guest_handoff', { p_id: r.id }).catch(() => false))) {
+      const full = 'That one needs the main session, and this group has used its hourly allowance for those. Ask again later. I still answer what I know myself.'
+      await send(m.chat.id, full, m.message_id)
+      await db('tg_fast_done', { p_id: r.id, p_text: full })
+      return { handled: 'message', action: 'session_limit' }
+    }
     await db('tg_fast_release', { p_id: r.id, p_note: `fast responder ${f.kind}: ${f.text}` })
     if (f.kind === 'handoff' && r.listening) await send(m.chat.id, 'Passing this to the main session. About 20 seconds.', m.message_id)
   }
