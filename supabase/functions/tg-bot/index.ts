@@ -320,6 +320,12 @@ async function onSession(body: any, begin: any) {
         member,
       }
     }
+    case 'leave': {
+      // Walk out of a chat. Used when nobody present can remove the bot (only a group admin can) and it has to be
+      // added again, for example so that a privacy-mode change takes effect.
+      const r = await tg('leaveChat', { chat_id: Number(body.chat_id) })
+      return { ok: !!r?.ok, error: r?.ok ? null : r?.description ?? 'no answer' }
+    }
     case 'fast_test': {
       // What would the fast responder say to stored message `id`? Nothing is sent to Telegram.
       const started = Date.now()
