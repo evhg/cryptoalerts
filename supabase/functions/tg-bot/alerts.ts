@@ -309,6 +309,17 @@ export async function evaluate(rule: Rule, sinceMs: number, cache: Cache = new M
   return { ok: true, hit: fresh && cmp(last.c, avg), value: last.c, closedAt, detail: `${at} closed at ${fmt(last.c)}; the ${period}-period ${rule.metric.toUpperCase()} is ${fmt(avg)}.` }
 }
 
+/** "BTC ETH" -> "BTC 59,300\nETH 1,648\nOKX last price, 28 Nov 22:45 Bangkok time." At most five coins. */
+export async function priceReply(words: string): Promise<string> {
+  const symbols = [...new Set(words.toUpperCase().split(/[^A-Z0-9]+/).map((x) => x.replace(/(USDT|USD)$/, '')).filter((x) => /^[A-Z0-9]{2,12}$/.test(x)))].slice(0, 5)
+  if (!symbols.length) return 'Which coin?'
+  const cache: Cache = new Map()
+  const prices = await Promise.all(symbols.map((x) => lastPrice(x, cache).catch(() => undefined)))
+  if (prices.every((p) => p === undefined)) return 'The price sources are not answering right now.'
+  const lines = symbols.map((x, i) => (prices[i] ? `${x} ${fmt(prices[i])}` : prices[i] === null ? `${x}: not listed on OKX or Hyperliquid` : `${x}: no answer right now`))
+  return [...lines, `Last price in USDT, ${bkk(Date.now())} Bangkok time.`].join('\n')
+}
+
 export const ALERT_HELP = [
   'Alerts, one line each:',
   '/alert BTC below 58500 (as soon as the price trades there)',

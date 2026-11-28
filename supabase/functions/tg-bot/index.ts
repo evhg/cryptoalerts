@@ -7,7 +7,7 @@
 // Telegram user id that Telegram itself puts on the update. The wake-up call carries no instructions, only a note
 // that messages are waiting; the session reads them from the database.
 
-import { alertReply, alertsTick } from './alerts.ts'
+import { alertReply, alertsTick, priceReply } from './alerts.ts'
 
 const env = (k: string) => Deno.env.get(k) ?? ''
 const SUPABASE_URL = env('SUPABASE_URL')
@@ -123,7 +123,7 @@ async function wake(note: Record<string, unknown>): Promise<{ ok: boolean; detai
   }
 }
 
-type Fast = { kind: 'answer' | 'handoff' | 'error' | 'alert'; text: string }
+type Fast = { kind: 'answer' | 'handoff' | 'error' | 'alert' | 'price'; text: string }
 
 /**
  * Ask the small model. It sees public facts only: the briefing the session maintains, live numbers, recent on-chain
@@ -159,7 +159,9 @@ async function fastAnswer(id: number): Promise<Fast> {
     'ALERT <COIN> RSI <15m|1h|4h|1d> BELOW|ABOVE <level>',
     'ALERT <COIN> SMA <length> <15m|1h|4h|1d> BELOW|ABOVE   or the same with EMA   (a candle closes under or over its moving average)',
     'ALERT LIST   and   ALERT DELETE <number>',
-    'Use the ticker (BTC, ETH, SOL) and plain numbers (58500, not 58.5k). If no candle size is given for RSI use 4h, for a moving average use 1d. If the request needs something these forms cannot express (MACD, volume, percent moves, two conditions at once, repeating alerts), do not write ALERT: say in one line that alerts cover a price level, a candle close, RSI and SMA/EMA.',
+    'Use the ticker (BTC, ETH, SOL) and plain numbers (58500, not 58.5k). If no candle size is given for RSI use 4h, for a moving average use 1d. If the request needs something these forms cannot express (MACD, volume, percent moves, two conditions at once, repeating alerts), do not use the word ALERT at all: say in one line that alerts cover a price level, a candle close, RSI and SMA/EMA.',
+    '',
+    'Prices: you do not know what any coin costs right now. When the message only asks for the current price of one or more coins, reply with exactly PRICE followed by the tickers (for example: PRICE BTC ETH) and nothing else; the bot looks them up and answers.',
     '',
     owner
       ? 'When not to answer: if the owner gives an instruction (do, change, run, test, deploy, arm, switch, send, post, remind), asks about private details (their position, wallets, balances, settings, costs, what the bot did and why), refers to earlier work you have no record of, or asks anything you cannot fully answer from below, reply with the single word HANDOFF and nothing else. The main session then answers in about 20 seconds.'
@@ -204,11 +206,16 @@ async function fastAnswer(id: number): Promise<Fast> {
   if (/^\W*HANDOFF\b/i.test(text)) {
     return owner || guestQuestions ? { kind: 'handoff', text: 'model asked for the main session' } : { kind: 'answer', text: 'Sorry, that is not something I can help with here.' }
   }
-  // An alert request comes back as command lines; code carries them out (at most five in one message).
+  // An alert request comes back as command lines; code carries them out (at most five in one message). Anything after
+  // the word ALERT that is not one of the fixed forms is not carried out.
   if (/^\W*ALERT\b/.test(text)) {
     const lines = text.split('\n').map((l) => l.trim()).filter((l) => /^\W*ALERT\b/.test(l)).map((l) => l.replace(/^\W*ALERT\b[:\s]*/, ''))
-    return { kind: 'alert', text: lines.slice(0, 5).join('\n') }
+      .filter((l) => /^(LIST|HELP|DELETE\s+#?\d+|[A-Z0-9]{2,12}\s+(BELOW|ABOVE|CLOSE|RSI|SMA|EMA)\b)/i.test(l))
+    if (lines.length) return { kind: 'alert', text: lines.slice(0, 5).join('\n') }
+    return { kind: 'answer', text: 'Alerts cover a price level, a candle close, RSI, and a close above or below an SMA or EMA. Send /alert to see the forms.' }
   }
+  const price = text.match(/^\W*PRICE\b[:\s]+([A-Za-z0-9 ,/]{2,80})$/)
+  if (price) return { kind: 'price', text: price[1] }
   return { kind: 'answer', text }
 }
 
@@ -283,6 +290,12 @@ async function onUpdate(update: any, botUsername: string) {
       await send(m.chat.id, reply, m.message_id)
       await db('tg_fast_done', { p_id: r.id, p_text: reply })
       return { handled: 'message', action: 'alert' }
+    }
+    if (f.kind === 'price') {
+      const reply = await priceReply(f.text).catch(() => 'The price sources are not answering right now.')
+      await send(m.chat.id, reply, m.message_id)
+      await db('tg_fast_done', { p_id: r.id, p_text: reply })
+      return { handled: 'message', action: 'price' }
     }
     if (f.kind === 'answer') {
       await send(m.chat.id, f.text, m.message_id)
@@ -408,7 +421,9 @@ async function onSession(body: any, begin: any) {
       // What would the fast responder say to stored message `id`? Nothing is sent to Telegram.
       const started = Date.now()
       const f = await fastAnswer(Number(body.id)).catch((e) => ({ kind: 'error' as const, text: String(e).slice(0, 200) }))
-      return { ...f, ms: Date.now() - started, has_key: !!FAST_KEY }
+      // For a price question also show what the bot would answer (a read-only lookup).
+      const reply = f.kind === 'price' ? await priceReply(f.text).catch(() => 'The price sources are not answering right now.') : undefined
+      return { ...f, reply, ms: Date.now() - started, has_key: !!FAST_KEY }
     }
     case 'wake_test':
       return await wake({ source: 'telegram bridge', test: true })
