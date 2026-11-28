@@ -303,9 +303,21 @@ async function onSession(body: any, begin: any) {
     }
     case 'status': {
       const info = await tg('getWebhookInfo', {})
+      // What Telegram itself says: whether the bot is sent every group message (privacy mode off), and, for a
+      // chat given as `chat_id`, whether the bot is still a member there. A privacy change only counts in a group
+      // once the bot has been removed and added again, or made an admin.
+      const me = await tg('getMe', {})
+      let member: unknown = null
+      if (body.chat_id && me?.ok) {
+        const m = await tg('getChatMember', { chat_id: Number(body.chat_id), user_id: me.result.id })
+        member = m?.ok ? { status: m.result.status } : { error: m?.description ?? 'no answer' }
+      }
       return {
         ok: true, has_bot_token: !!TOKEN, fast_responder_key: !!FAST_KEY, wake_configured: !!FIRE_URL && !!FIRE_TOKEN, bot: begin.bot_username,
-        webhook: info?.ok ? { url_set: !!info.result.url, pending: info.result.pending_update_count, last_error: info.result.last_error_message ?? null } : info?.description,
+        webhook: info?.ok ? { url_set: !!info.result.url, pending: info.result.pending_update_count, last_error: info.result.last_error_message ?? null,
+          last_error_at: info.result.last_error_date ?? null, allowed_updates: info.result.allowed_updates ?? null } : info?.description,
+        reads_all_group_messages: me?.ok ? !!me.result.can_read_all_group_messages : null,
+        member,
       }
     }
     case 'fast_test': {
