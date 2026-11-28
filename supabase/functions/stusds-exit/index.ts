@@ -1057,10 +1057,18 @@ async function safeTxList(ctx: Ctx, safe: Hex) {
   const url = `${SAFE_API}/safes/${safe}/multisig-transactions/?limit=12`
   const key = env('SAFE_API_KEY')
   const notes: string[] = []
-  if (key && Date.now() >= safeKeyRestUntil) {
+  // The key's plan has a monthly allowance (50,000 requests on 28 November). At a minute or more between polls each
+  // Safe is asked once per `safe_poll_seconds` across all runs, and the answer is stored for the rounds in between.
+  const everySec = Math.max(3, Number(ctx.config.safe_poll_seconds ?? 10))
+  const paced = everySec >= 60
+  if (key && Date.now() >= safeKeyRestUntil && (!paced || (await claim(ctx, `safe_keyed:${safe}:${Math.floor(Date.now() / (everySec * 1000))}`)))) {
     try {
       const r = await fetch(url, { headers: { authorization: `Bearer ${key}` }, signal: AbortSignal.timeout(8000) })
-      if (r.ok) return await r.json()
+      if (r.ok) {
+        const body = await r.json()
+        if (paced) await db('stusds_exit_safe_store', { p_secret: ctx.secret, p_safe: safe, p_status: 200, p_body: body, p_remaining: -1, p_reset: 0 }).catch(() => null)
+        return body
+      }
       notes.push(`with key ${r.status} ${(await r.text()).slice(0, 80).trim()}`)
       // A refusal for quota or access does not change within minutes: leave the key alone for a while.
       if ([401, 403, 429].includes(r.status)) safeKeyRestUntil = Date.now() + 10 * 60_000
@@ -1071,7 +1079,8 @@ async function safeTxList(ctx: Ctx, safe: Hex) {
   // One request per Safe and slot, whichever run gets there first; a missed slot is covered by the stored answer.
   const pace = Math.max(300, Number(ctx.config.safe_keyless_seconds ?? 1200)) * 1000
   const slot = Math.floor(Date.now() / pace)
-  if (await claim(ctx, `safe_keyless:${safe}:${slot}`)) {
+  const keyOut = !key || notes.length > 0 || Date.now() < safeKeyRestUntil
+  if (keyOut && (await claim(ctx, `safe_keyless:${safe}:${slot}`))) {
     try {
       const r = await fetch(url, { signal: AbortSignal.timeout(8000) })
       const body = r.ok ? await r.json() : null
