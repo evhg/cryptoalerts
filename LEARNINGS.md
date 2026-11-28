@@ -103,9 +103,27 @@ nothing. This settled every builder question in minutes where real deposits had 
   100.03 USDS on the rune.eth Safe's loan (`wipe` on its behalf, block 26507073, Titan). None of the three feeds
   delivered it, the run logged 0 candidates. A rival arb sat directly behind it and paid the builder about 81% of a
   2.42 USDS margin. Our end-of-block arb was with Titan for that block at a 99.5% share and got nothing: it is tried
-  after the bundles that carry the freeing transaction, so the better bid did not help. No rebate to the sender is
-  visible, so the route the rival got the transaction by is unknown (public and missed by our feeds, or an order-flow
-  auction).
+  after the bundles that carry the freeing transaction, so the better bid did not help (Titan's documentation: these
+  bundles are simulated "after building a block").
+- 28 November, how rivals get behind a repayment nobody saw. Checked for the five unseen repayments of 23 to 27
+  November:
+  - Flashbots' Mempool Dumpster (`mempool-dumpster.flashbots.net`, daily archive pooled from many feeds) has none of
+    the five. It has the four public repayments of 25 November, seen 3 to 11 seconds before they were mined. It saw 46%
+    and 64% of the two blocks sampled, about what our free feeds see (58%), so a better feed is not the gap. Caveat:
+    the archive also lacks our own two "public race" test deposits, so absence alone is not proof of a private route.
+  - In three of the five (13,950 and 20,000 USDS on 24 November, both ERC-4337 operations sent by a bundler; 100 USDS
+    on 27 November) the builder paid back 90% (bombora, Titan) or 99% (Quasar) of the rival's bid in the same block to
+    one address, `0x22cb221cae98d6097082c80158b1472c45fed729`. The relays confirm the proposers were paid separately.
+    That is the footprint of an order-flow auction: the rival bid for the right to follow a private transaction and
+    most of the bid went back to whoever supplied the transaction. It was not Flashbots MEV-Share (its history has none
+    of them). Which auction is not identified; the address is a deposit address that is swept to a large exchange
+    wallet and is paid in about 9 of 100 blocks.
+  - The refund does not show in call traces: builders pay through the slot-guard forwarder
+    `0xFEEEEEE44046c3f61a8CC081E0918eF0de0a7ffC`, which passes ETH on by `SELFDESTRUCT`. Read the recipient from the
+    last 20 bytes of the builder's calldata. An earlier check that found "no rebate" looked only at traces.
+  - The other two (30,001 USDS on 23 November, 33,380 on 27 November 01:31) show no refund in the block. Route unknown.
+  - Consequence: for that flow the race is decided inside the auction, before any builder ranks our conditional
+    bundle. The way in is to become a bidder there (MEV Blocker, Blink, bloXroute BackRunMe each need a sign-up).
 - Other pending-feed hosts refused the connection or needed keys. MEV Blocker's searcher stream needs registration.
 
 ## 5. Bidding
